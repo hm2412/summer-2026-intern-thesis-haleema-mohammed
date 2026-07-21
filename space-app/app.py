@@ -79,7 +79,7 @@ for col, ticker in zip(cols, selected_space):
         label=ticker,
         value=f"{row['annualised_volatility_pct']:.1f}% vol",
         delta=f"{row['max_drawdown_pct']:.1f}% max DD",
-        delta_color="inverse",  # a deeper drawdown is "bad", so colour it red
+        delta_color="normal",  # a deeper drawdown is "bad", so colour it red
     )
 
 st.divider()
@@ -96,14 +96,14 @@ with tab_corr:
     corr_space = compute_correlation_matrix(returns_f, selected_space)
     st.plotly_chart(
         plot_correlation_heatmap(corr_space, "Space Stocks: Return Correlation"),
-        use_container_width=True,
+        width='stretch',
     )
 
     st.subheader("Space stocks vs benchmarks")
     corr_cross = compute_cross_correlation(returns_f, selected_space, BENCHMARKS)
     st.plotly_chart(
         plot_correlation_heatmap(corr_cross, "Space Stocks vs Benchmarks: Return Correlation"),
-        use_container_width=True,
+        width='stretch',
     )
     st.caption(
         "Space stocks tend to correlate most with ARKK (speculative growth), though even "
@@ -113,7 +113,7 @@ with tab_corr:
 with tab_beta:
     st.subheader(f"Beta & R² vs {selected_benchmark}")
     beta_table = compute_beta_table(returns_f, selected_space + SPACE_ETFS, selected_benchmark)
-    st.dataframe(beta_table, use_container_width=True)
+    st.dataframe(beta_table, width='stretch')
     st.caption(
         "High beta with low R² means these stocks amplify market moves but are mostly "
         "driven by idiosyncratic, company-specific volatility rather than the market. "
@@ -127,19 +127,19 @@ with tab_beta:
         with sub_tab:
             stats_row = compute_beta_and_r2(returns_f, ticker, selected_benchmark)
             fig = plot_regression_scatter(returns_f, ticker, selected_benchmark, stats_row)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
 with tab_vol:
     st.subheader("Annualised volatility & max drawdown")
     display_tickers = list(dict.fromkeys(selected_space + [selected_benchmark]))
     st.plotly_chart(
         plot_vol_drawdown_bar(vol_table.loc[display_tickers]),
-        use_container_width=True,
+        width='stretch',
     )
     with st.expander("Show underlying numbers"):
         st.dataframe(
             vol_table.sort_values("annualised_volatility_pct", ascending=False),
-            use_container_width=True,
+            width='stretch',
         )
 
     st.subheader("Cumulative returns")
@@ -147,13 +147,13 @@ with tab_vol:
         selected_space + [selected_benchmark] + [t for t in SPACE_ETFS if t in prices_f.columns]
     ))
     indexed = compute_cumulative_returns(prices_f, cum_tickers)
-    st.plotly_chart(plot_cumulative_returns(indexed), use_container_width=True)
+    st.plotly_chart(plot_cumulative_returns(indexed), width='stretch')
     st.caption("Indexed to 100 at the start of the selected date range — drag the sidebar date slider to rebase.")
 
     st.subheader("Rolling volatility")
     rolling_tickers = list(dict.fromkeys(selected_space + [selected_benchmark]))
     rolling_vol = compute_rolling_volatility(returns_f, rolling_tickers, window=vol_window)
-    st.plotly_chart(plot_rolling_volatility(rolling_vol, vol_window), use_container_width=True)
+    st.plotly_chart(plot_rolling_volatility(rolling_vol, vol_window), width='stretch')
     st.caption(
         "Drag the range slider below the chart to zoom into a specific period. "
         "Manually-curated event markers land here next."
