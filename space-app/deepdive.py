@@ -188,16 +188,24 @@ def _build_price_return_chart(hist: pd.DataFrame, ipo_date: str | None, ticker: 
     indexed = window["Close"] / first_value * 100.0
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=window.index, y=indexed, mode="lines", name="Indexed price", line=dict(color="#1f77b4", width=3)))
-    fig.add_vrect(x0=pd.Timestamp("2021-01-01"), x1=pd.Timestamp("2022-12-31"), fillcolor="#e34948", opacity=0.08, line_width=0)
+    fig.add_trace(go.Scatter(
+        x=window.index, y=indexed, mode="lines", name="Indexed price",
+        line=dict(color="#8fbcff", width=3),
+        fill="tozeroy", fillcolor="rgba(143,188,255,0.12)",
+    ))
+    fig.add_vrect(x0=pd.Timestamp("2021-01-01"), x1=pd.Timestamp("2022-12-31"), fillcolor="#ff7a72", opacity=0.12, line_width=0)
     fig.update_layout(
         title=f"{ticker}: indexed price return",
         xaxis_title="Date",
         yaxis_title="Index (start = 100)",
-        template="plotly_white",
+        template="plotly_dark",
+        paper_bgcolor="#151b28",
+        plot_bgcolor="#151b28",
+        font=dict(color="#e9edf5"),
         margin=dict(t=50, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        xaxis=dict(range=[window.index.min(), window.index.max()]),
+        xaxis=dict(range=[window.index.min(), window.index.max()], gridcolor="#2a3345"),
+        yaxis=dict(gridcolor="#2a3345"),
     )
     return fig
 
@@ -221,13 +229,16 @@ def _build_fundamentals_chart(revenue_series: dict[str, float], fcf_margin_serie
             revenue_growth.append((current_value / prev_value - 1) * 100)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=periods, y=[fcf_margin_series.get(p) for p in periods], mode="lines+markers", name="FCF margin (%)", yaxis="y1", line=dict(color="#2a78d6", width=2)))
-    fig.add_trace(go.Scatter(x=periods, y=revenue_growth, mode="lines+markers", name="Revenue growth YoY (%)", yaxis="y2", line=dict(color="#e34948", width=2)))
+    fig.add_trace(go.Scatter(x=periods, y=[fcf_margin_series.get(p) for p in periods], mode="lines+markers", name="FCF margin (%)", yaxis="y1", line=dict(color="#ff7a72", width=2), marker=dict(color="#ff7a72")))
+    fig.add_trace(go.Scatter(x=periods, y=revenue_growth, mode="lines+markers", name="Revenue growth YoY (%)", yaxis="y2", line=dict(color="#8fbcff", width=2), marker=dict(color="#8fbcff")))
     fig.update_layout(
         title=f"{ticker}: fundamentals trend",
-        template="plotly_white",
+        template="plotly_dark",
+        paper_bgcolor="#151b28",
+        plot_bgcolor="#151b28",
+        font=dict(color="#e9edf5"),
         yaxis=dict(title="FCF margin (%)", showgrid=False),
-        yaxis2=dict(title="Revenue growth YoY (%)", overlaying="y", side="right"),
+        yaxis2=dict(title="Revenue growth YoY (%)", overlaying="y", side="right", showgrid=False),
         margin=dict(t=50, b=20),
     )
     return fig
@@ -243,7 +254,15 @@ def _build_narrative_chart(ticker: str, years: list[int], revenue_series: list[f
         start_year=years[0],
         bubble_band=(2021, 2022),
     )
-    fig.update_layout(title=f"{ticker}: narrative vs. fundamentals vs. price")
+    # narrative.py builds this figure with its own trace colors, so we only
+    # override the theme-level settings here rather than individual traces.
+    fig.update_layout(
+        title=f"{ticker}: narrative vs. fundamentals vs. price",
+        template="plotly_dark",
+        paper_bgcolor="#151b28",
+        plot_bgcolor="#151b28",
+        font=dict(color="#e9edf5"),
+    )
     return fig
 
 
@@ -306,10 +325,36 @@ def render_deep_dive(stock: dict):
         price_to_sales = info.get("priceToSalesTrailing12Months")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Market cap", _format_currency(market_cap))
-    c2.metric("Free cash flow", _format_currency(latest_fcf))
-    c3.metric("Revenue growth YoY", _format_pct(revenue_growth))
-    c4.metric("Price/sales", _format_ratio(price_to_sales))
+    c1.html(f"""
+            <div>
+            <div style="font-size:0.9rem;">Market cap</div>
+            <div style="font-size:2.5rem;font-weight:600; color: white">{_format_currency(market_cap)}</div>
+            </div>
+            """)
+    c2.html(f"""
+        <div>
+        <div style="font-size:0.9rem;">Free cash flow</div>
+        <div style="font-size:2.5rem;font-weight:600;
+                    color:{'green' if latest_fcf >= 0 else 'red'}">
+            {_format_currency(latest_fcf)}
+        </div>
+        </div>
+        """)
+    c3.html(f"""
+    <div>
+    <div style="font-size:0.9rem;">Revenue growth YoY</div>
+    <div style="font-size:2.5rem;font-weight:600;
+                color:{'green' if revenue_growth >= 0 else 'red'}">
+        {_format_pct(revenue_growth)}
+    </div>
+    </div>
+    """)
+    c4.html(f"""
+            <div>
+            <div style="font-size:0.9rem;">Price/sales</div>
+            <div style="font-size:2.5rem;font-weight:600; color: white">{_format_ratio(price_to_sales)}</div>
+            </div>
+            """)
 
     st.divider()
 

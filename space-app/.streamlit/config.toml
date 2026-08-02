@@ -1,2 +1,10 @@
 [theme.sidebar]
 primaryColor="darkBlue"
+
+[theme]
+base = "dark"
+primaryColor = "#8fbcff"
+backgroundColor = "#0a0e17"
+secondaryBackgroundColor = "#151b28"
+textColor = "#e9edf5"
+font = "sans serif"
