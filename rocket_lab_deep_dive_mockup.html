@@ -1,0 +1,84 @@
+<div>
+<h2 class="sr-only">Mockup of a deep-dive dashboard for a single space stock, showing header, key metrics, price chart with time-horizon toggle, profitability trend, and narrative-versus-reality comparison</h2>
+
+<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem;">
+  <div style="display:flex; align-items:center; gap:12px;">
+    <div style="width:40px; height:40px; border-radius:50%; background:var(--bg-accent); display:flex; align-items:center; justify-content:center; color:var(--text-accent); font-size:14px; font-weight:500;">RKLB</div>
+    <div>
+      <p style="font-weight:500; font-size:16px; margin:0;">Rocket Lab USA</p>
+      <p style="font-size:13px; color:var(--text-secondary); margin:0;">Launch &middot; SPAC-listed 2021</p>
+    </div>
+  </div>
+  <button style="font-size:13px;"><i class="ti ti-x" aria-hidden="true" style="font-size:14px; vertical-align:-2px; margin-right:4px;"></i>Close</button>
+</div>
+
+<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:1.5rem;">
+  <div style="background:var(--surface-1); border-radius:var(--radius); padding:1rem;">
+    <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">Market cap</p>
+    <p style="font-size:24px; font-weight:500; margin:0;">$18.2B</p>
+  </div>
+  <div style="background:var(--surface-1); border-radius:var(--radius); padding:1rem;">
+    <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">Free cash flow (TTM)</p>
+    <p style="font-size:24px; font-weight:500; margin:0; color:var(--text-danger);">-$142M</p>
+  </div>
+  <div style="background:var(--surface-1); border-radius:var(--radius); padding:1rem;">
+    <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">Revenue growth YoY</p>
+    <p style="font-size:24px; font-weight:500; margin:0; color:var(--text-success);">+62%</p>
+  </div>
+  <div style="background:var(--surface-1); border-radius:var(--radius); padding:1rem;">
+    <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">Price / sales</p>
+    <p style="font-size:24px; font-weight:500; margin:0;">21.4x</p>
+  </div>
+</div>
+
+<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+  <p style="font-size:14px; font-weight:500; margin:0;">Price return</p>
+  <div style="display:flex; gap:4px;">
+    <button style="font-size:12px; padding:4px 10px; border:2px solid var(--border-accent); color:var(--text-accent);">Since IPO</button>
+    <button style="font-size:12px; padding:4px 10px;">3Y</button>
+    <button style="font-size:12px; padding:4px 10px;">1Y</button>
+    <button style="font-size:12px; padding:4px 10px;">YTD</button>
+  </div>
+</div>
+<div style="position:relative; width:100%; height:200px; margin-bottom:0.5rem;">
+  <canvas id="priceChart" role="img" aria-label="Rocket Lab share price since IPO, showing a 2021 SPAC-era peak, a 2022-2023 decline, and a recovery">Price rose sharply after 2021 IPO, fell through 2022-2023, then recovered strongly into 2024-2026.</canvas>
+</div>
+<p style="font-size:12px; color:var(--text-muted); margin:4px 0 1.5rem;">Shaded band marks the 2021 SPAC boom / 2022 crash period</p>
+
+<p style="font-size:14px; font-weight:500; margin:0 0 8px;">Fundamentals vs. narrative</p>
+<div style="position:relative; width:100%; height:220px; margin-bottom:0.5rem;">
+  <canvas id="fundChart" role="img" aria-label="Bar and line chart comparing Rocket Lab quarterly free cash flow trend against analyst-projected revenue growth">Free cash flow losses have narrowed each year while revenue growth has stayed strong, suggesting improving fundamentals.</canvas>
+</div>
+<div style="display:flex; gap:16px; font-size:12px; color:var(--text-secondary); margin-bottom:1.5rem;">
+  <span style="display:flex; align-items:center; gap:4px;"><span style="width:10px; height:10px; border-radius:2px; background:#e34948;"></span>Free cash flow</span>
+  <span style="display:flex; align-items:center; gap:4px;"><span style="width:10px; height:10px; border-radius:2px; background:#2a78d6;"></span>Revenue growth %</span>
+</div>
+
+<div style="background:var(--surface-1); border-radius:var(--radius); padding:1rem;">
+  <p style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;">Where this planet sits</p>
+  <p style="font-size:14px; margin:0;">Mid-sized planet, still close to a wide orbit (cash-negative), fast speed (strong recent return) &mdash; a maturing pure-play, not yet a settled case either way.</p>
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const priceLabels = ['2021','2022','2023','2024','2025','2026'];
+const priceData = [11,3,4,9,15,22];
+new Chart(document.getElementById('priceChart'), {
+  type: 'line',
+  data: { labels: priceLabels, datasets: [{ data: priceData, borderColor:'#2a78d6', backgroundColor:'rgba(42,120,214,0.1)', fill:true, tension:0.3, pointRadius:0, borderWidth:2 }] },
+  options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} }, scales:{ y:{ ticks:{ callback:v=>'$'+v }, grid:{color:'#e1e0d9'} }, x:{ grid:{display:false} } } }
+});
+
+const fundLabels = ['2022','2023','2024','2025','2026'];
+new Chart(document.getElementById('fundChart'), {
+  data: {
+    labels: fundLabels,
+    datasets: [
+      { type:'bar', label:'FCF', data:[-260,-210,-180,-150,-142], backgroundColor:'#e34948', yAxisID:'y' },
+      { type:'line', label:'Revenue growth %', data:[18,25,44,58,62], borderColor:'#2a78d6', borderWidth:2, pointRadius:3, yAxisID:'y' }
+    ]
+  },
+  options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} }, scales:{ y:{ grid:{color:'#e1e0d9'} }, x:{ grid:{display:false} } } }
+});
+</script>

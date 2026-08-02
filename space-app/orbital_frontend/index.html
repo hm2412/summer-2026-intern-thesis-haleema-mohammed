@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+</style>
+</head>
+<body>
+<div id="orbital-root" style="position:relative;width:100%;
+     background:#0b0d14;border-radius:12px;overflow:hidden;
+     font-family:-apple-system,Segoe UI,Roboto,sans-serif;">
+  <svg id="orbital-svg" width="100%" height="100%" viewBox="0 0 1400 850"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <div id="tooltip" style="position:absolute;pointer-events:none;display:none;
+       background:rgba(20,22,28,0.96);color:#f2f2f2;padding:8px 10px;
+       border-radius:6px;font-size:12px;line-height:1.5;max-width:220px;
+       box-shadow:0 4px 12px rgba(0,0,0,0.4);z-index:5;"></div>
+  <div id="legend" style="position:absolute;top:12px;left:12px;
+       background:rgba(20,22,28,0.85);color:#ddd;padding:10px 14px;
+       border-radius:8px;font-size:12px;line-height:1.7;">
+    <div style="font-weight:600;margin-bottom:4px;">Legend</div>
+    <div>Size &mdash; market cap</div>
+    <div>Distance from sun &mdash; years to profitability</div>
+    <div>Orbit speed &mdash; fast = ahead of narrative, slow = behind</div>
+    <div><span style="color:#4fd1a5;">&#9679;</span> ahead of narrative &nbsp;
+         <span style="color:#ff6b6b;">&#9679;</span> behind narrative</div>
+  </div>
+</div>
+
+<script>
+/* -------------------------------------------------------------------
+ * Minimal hand-rolled implementation of the Streamlit Components v1
+ * postMessage protocol. We deliberately don't pull in the official
+ * "streamlit-component-lib" package to keep this dependency-free, same
+ * as the original file's design goal. Three message types matter:
+ *   - streamlit:componentReady  (sent once, on load)
+ *   - streamlit:render          (received; carries Python kwargs in .args)
+ *   - streamlit:setComponentValue (sent on click, returned to Python)
+ *   - streamlit:setFrameHeight  (sent so the iframe sizes correctly)
+ * ----------------------------------------------------------------- */
+
+function sendToStreamlit(type, extra) {
+  const payload = Object.assign({ isStreamlitMessage: true, type: type }, extra || {});
+  window.parent.postMessage(payload, "*");
+}
+
+function setComponentValue(value) {
+  sendToStreamlit("streamlit:setComponentValue", { value: value, dataType: "json" });
+}
+
+function setFrameHeight(height) {
+  sendToStreamlit("streamlit:setFrameHeight", { height: height });
+}
+
+let initialized = false;
+let lastStocksKey = null;
+
+function initOrbitalMap(stocks, height) {
+  const svgns = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("orbital-svg");
+  const tooltip = document.getElementById("tooltip");
+  const root = document.getElementById("orbital-root");
+  root.style.height = height + "px";
+
+  const CX = 700, CY = 425;
+  const RING_RADII = [130, 290, 440];
+  const RING_JITTER = 20;
+  const RING_COLORS = { mature: "#4fd1a5", scaling: "#9aa6ff", speculative: "#ff8f6b" };
+  const PERF_COLORS = { ahead: "#4fd1a5", behind: "#ff6b6b" };
+
+  const reduceMotion = window.matchMedia &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function el(tag, attrs) {
+    const e = document.createElementNS(svgns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  RING_RADII.forEach(function (r) {
+    svg.appendChild(el("circle", {
+      cx: CX, cy: CY, r: r, fill: "none",
+      stroke: "#333a4a", "stroke-width": 1, "stroke-dasharray": "3 5",
+    }));
+  });
+  svg.appendChild(el("circle", { cx: CX, cy: CY, r: 34, fill: "#f2a93b", opacity: 0.25 }));
+  svg.appendChild(el("circle", { cx: CX, cy: CY, r: 22, fill: "#f2c94c" }));
+  const sunLabel = el("text", { x: CX, y: CY + 46, "text-anchor": "middle", fill: "#aaa", "font-size": 12 });
+  sunLabel.textContent = "Profitability";
+  svg.appendChild(sunLabel);
+
+  const capsBillions = stocks.map(function (s) { return s.market_cap / 1e9; });
+  const maxCap = Math.max.apply(null, capsBillions);
+  function radiusFor(marketCap) {
+    const b = marketCap / 1e9;
+    const r = 10 + (Math.sqrt(b) / Math.sqrt(maxCap)) * 42;
+    return Math.max(10, Math.min(52, r));
+  }
+
+  const MIN_SPEED_DEG = 2;
+  const MAX_SPEED_DEG = 45;
+  const relReturns = stocks.map(function (s) { return s.relative_return_pct; });
+  const relMin = Math.min.apply(null, relReturns);
+  const relMax = Math.max.apply(null, relReturns);
+
+  function speedDegPerSecFor(relativeReturnPct) {
+    if (relMax === relMin) return (MIN_SPEED_DEG + MAX_SPEED_DEG) / 2;
+    const t = (relativeReturnPct - relMin) / (relMax - relMin);
+    return MIN_SPEED_DEG + t * (MAX_SPEED_DEG - MIN_SPEED_DEG);
+  }
+
+  const planets = stocks.map(function (s, i) {
+    const jitter = ((i * 37) % RING_JITTER) - RING_JITTER / 2;
+    const ringR = RING_RADII[s.ring] + jitter;
+    const angle0 = (i / stocks.length) * Math.PI * 2;
+    const speedDeg = speedDegPerSecFor(s.relative_return_pct);
+    const r = radiusFor(s.market_cap);
+    const fillColor = RING_COLORS[s.tier] || "#8a8a8a";
+    const strokeColor = s.relative_return_pct >= 0 ? PERF_COLORS.ahead : PERF_COLORS.behind;
+
+    const g = el("g", { style: "cursor:pointer;" });
+    const circle = el("circle", { r: r, fill: fillColor, opacity: 0.9, stroke: strokeColor, "stroke-width": 2.5 });
+    g.appendChild(circle);
+    svg.appendChild(g);
+
+    g.addEventListener("mouseenter", function () { showTooltip(s); });
+    g.addEventListener("mousemove", function (ev) { positionTooltip(ev); });
+    g.addEventListener("mouseleave", function () { tooltip.style.display = "none"; });
+
+    /* This is the fix: report the click straight to Python via the
+       component protocol instead of trying to navigate the parent page,
+       which the sandboxed iframe silently blocks. */
+    g.addEventListener("click", function () {
+      setComponentValue(s.ticker);
+    });
+
+    return { s: s, g: g, ringR: ringR, angle: angle0, speedDeg: speedDeg };
+  });
+
+  function showTooltip(s) {
+    const relSign = s.relative_return_pct >= 0 ? "+" : "";
+    tooltip.innerHTML =
+      "<div style='font-weight:600;margin-bottom:2px;'>" + s.ticker + " &mdash; " + s.name + "</div>" +
+      "<div>Market cap: $" + (s.market_cap / 1e9).toFixed(1) + "B</div>" +
+      "<div>Return since IPO: " + s.return_since_ipo_pct.toFixed(0) + "%</div>" +
+      "<div>Vs. narrative benchmark: " + relSign + s.relative_return_pct.toFixed(0) + " pts</div>" +
+      "<div>Years to profitability: " + (s.years_to_profitability === null ? "no consensus" : s.years_to_profitability) + "</div>" +
+      "<div style='margin-top:4px;color:#9aa;'>Click to view detail</div>";
+    tooltip.style.display = "block";
+  }
+
+  function positionTooltip(ev) {
+    const rect = root.getBoundingClientRect();
+    tooltip.style.left = (ev.clientX - rect.left + 14) + "px";
+    tooltip.style.top = (ev.clientY - rect.top + 14) + "px";
+  }
+
+  let lastTs = null;
+  function frame(ts) {
+    if (lastTs === null) lastTs = ts;
+    const dtSec = (ts - lastTs) / 1000;
+    lastTs = ts;
+    planets.forEach(function (p) {
+      if (!reduceMotion) p.angle += (p.speedDeg * Math.PI / 180) * dtSec;
+      const x = CX + p.ringR * Math.cos(p.angle);
+      const y = CY + p.ringR * Math.sin(p.angle);
+      p.g.setAttribute("transform", "translate(" + x + "," + y + ")");
+    });
+    if (!reduceMotion) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  setFrameHeight(height + 10);
+}
+
+window.addEventListener("message", function (event) {
+  const data = event.data;
+  if (!data || data.type !== "streamlit:render") return;
+
+  const args = data.args || {};
+  const stocks = args.stocks || [];
+  const height = args.height || 850;
+
+  // Guard against re-initializing (and restarting the animation) on every
+  // Streamlit script rerun — only rebuild if the actual dataset changed.
+  const stocksKey = JSON.stringify(stocks);
+  if (initialized && stocksKey === lastStocksKey) {
+    setFrameHeight(height + 10);
+    return;
+  }
+  initialized = true;
+  lastStocksKey = stocksKey;
+  initOrbitalMap(stocks, height);
+});
+
+sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>
