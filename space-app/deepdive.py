@@ -1,19 +1,60 @@
-"""Requirements-driven deep-dive view for a single space-economy company."""
+"""Requirements-driven deep-dive view for a single space-economy company.
+
+Answers the project thesis: have publicly traded space economy stocks
+delivered returns commensurate with the growth narrative, or do they
+remain speculative with no near-term path to profitability?
+"""
 
 from __future__ import annotations
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
 
-from narrative import build_narrative_gap_chart, narrative_cagr_from_config
-from narrative_config import NARRATIVE_FORECAST
+from data import (
+    BENCHMARKS,
+    HISTORICAL_EVENTS,
+    SPACE_COMPANIES,
+    compute_cash_runway,
+    latest_operating_margin,
+    latest_revenue_growth,
+    latest_value,
+    load_company_fundamentals,
+    load_full_price_history,
+    peer_growth_margin,
+)
+
+# ---------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------
+THEME = {
+    "bg": "#151b28",
+    "text": "#e9edf5",
+    "grid": "#2a3345",
+    "blue": "#8fbcff",
+    "blue_fill": "rgba(143,188,255,0.12)",
+    "red": "#ff7a72",
+    "green": "#7ce38b",
+    "amber": "#ffcf70",
+    "muted": "#4a5568",
+}
+
+# Only these three benchmarks are offered in the Chart 1 toggle, per the
+# dashboard requirements (BENCHMARKS in data.py has a couple of extras
+# used elsewhere in the app).
+CHART1_BENCHMARKS = {
+    name: BENCHMARKS[name] for name in ("S&P 500", "Nasdaq Composite", "ARK Space ETF (ARKX)")
+}
 
 
+# ---------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------
 def _format_currency(value: float | None, prefix: str = "$") -> str:
     if value is None or pd.isna(value):
         return "N/A"
+    if abs(value) >= 1e12:
+        return f"{prefix}{value / 1e12:.1f}T"
     if abs(value) >= 1e9:
         return f"{prefix}{value / 1e9:.1f}B"
     if abs(value) >= 1e6:
@@ -27,245 +68,393 @@ def _format_pct(value: float | None) -> str:
     return f"{value:.1f}%"
 
 
-def _format_ratio(value: float | None) -> str:
-    if value is None or pd.isna(value):
+def _format_runway(years: float | None, is_cash_generating: bool) -> str:
+    if is_cash_generating:
+        return "Cash Generating"
+    if years is None or pd.isna(years):
         return "N/A"
-    return f"{value:.2f}x"
+    return f"{years:.1f} yrs"
 
 
-def _infer_company_tier(stock: dict) -> str:
-    if stock.get("sector_tier"):
-        return str(stock["sector_tier"])
-    ticker = stock.get("ticker", "")
-    pure_play_tickers = {"RKLB", "ASTS", "PL", "SPCE", "BKSY", "LUNR", "RDW"}
-    return "Pure-play" if ticker in pure_play_tickers else "Prime"
+def _kpi_color(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "white"
+    return THEME["green"] if value >= 0 else THEME["red"]
 
 
-def _infer_listing_method(stock: dict) -> str:
-    if stock.get("listing_method"):
-        return str(stock["listing_method"])
-    ticker = stock.get("ticker", "")
-    if ticker in {"RKLB", "ASTS", "PL", "SPCE", "BKSY", "LUNR", "RDW"}:
-        return "SPAC-listed"
-    return "Traditional"
+# ---------------------------------------------------------------------
+# Chart theming / event annotation helpers
+# ---------------------------------------------------------------------
+def _apply_dark_theme(fig: go.Figure, title: str) -> go.Figure:
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor=THEME["bg"],
+        plot_bgcolor=THEME["bg"],
+        font=dict(color=THEME["text"]),
+        margin=dict(t=70, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.1),
+        xaxis=dict(gridcolor=THEME["grid"]),
+        yaxis=dict(gridcolor=THEME["grid"]),
+        hovermode="x unified",
+    )
+    return fig
 
 
-def _extract_series(statement: pd.DataFrame | None, row_name: str) -> dict[str, float]:
-    if statement is None or statement.empty:
-        return {}
-    if row_name in statement.index:
-        series = statement.loc[row_name]
-    else:
-        return {}
+def _add_event_shading(fig: go.Figure, x_min, x_max) -> go.Figure:
+    """
+    Shades COVID / SPAC boom / rate-rise sell-off regions on any chart
+    whose date range overlaps 2020-2022, per the "Historical Event
+    Markers" requirement. Skipped entirely for charts with no overlap
+    (e.g. a company with data only from 2023 onward).
+    """
+    if x_min is None or x_max is None:
+        return fig
+    x_min, x_max = pd.Timestamp(x_min), pd.Timestamp(x_max)
 
-    values: dict[str, float] = {}
-    for idx, val in series.items():
-        if pd.isna(val):
+    for event in HISTORICAL_EVENTS:
+        ev_start, ev_end = pd.Timestamp(event["start"]), pd.Timestamp(event["end"])
+        if ev_end < x_min or ev_start > x_max:
             continue
-        try:
-            period = pd.Timestamp(idx).to_period("Q") if isinstance(idx, pd.Timestamp) else idx
-        except Exception:
-            period = idx
-        if hasattr(period, "strftime"):
-            key = period.strftime("%YQ%q") if hasattr(period, "quarter") else str(period)
+        clipped_start = max(ev_start, x_min)
+        clipped_end = min(ev_end, x_max)
+        fig.add_vrect(
+            x0=clipped_start,
+            x1=clipped_end,
+            fillcolor=event["color"],
+            opacity=0.10,
+            line_width=0,
+        )
+        midpoint = clipped_start + (clipped_end - clipped_start) / 2
+        fig.add_annotation(
+            x=midpoint,
+            y=1.02,
+            yref="paper",
+            xref="x",
+            text=event["label"],
+            showarrow=False,
+            font=dict(size=10, color=THEME["text"]),
+            textangle=0,
+        )
+    return fig
+
+
+# ---------------------------------------------------------------------
+# Chart 1 — Stock Performance
+# ---------------------------------------------------------------------
+def _build_stock_performance_chart(ticker: str, company_hist: pd.DataFrame) -> go.Figure:
+    benchmark_name = st.radio(
+        "Compare against",
+        list(CHART1_BENCHMARKS.keys()),
+        horizontal=True,
+        key=f"{ticker}_benchmark",
+    )
+    benchmark_ticker = CHART1_BENCHMARKS[benchmark_name]
+
+    try:
+        benchmark_hist = load_full_price_history(benchmark_ticker)
+    except Exception:
+        benchmark_hist = pd.DataFrame(columns=["Close"])
+
+    # Normalise both series to 100 at the later of the two start dates,
+    # so the comparison is apples-to-apples (a benchmark like ARKX only
+    # exists from 2021, well after most of these companies' IPOs).
+    common_start = company_hist.index.min()
+    if not benchmark_hist.empty:
+        common_start = max(common_start, benchmark_hist.index.min())
+
+    company_window = company_hist.loc[company_hist.index >= common_start]
+    fig = go.Figure()
+
+    if not company_window.empty:
+        company_indexed = company_window["Close"] / company_window["Close"].iloc[0] * 100
+        fig.add_trace(go.Scatter(
+            x=company_window.index, y=company_indexed, mode="lines", name=ticker,
+            line=dict(color=THEME["blue"], width=3),
+            fill="tozeroy", fillcolor=THEME["blue_fill"],
+        ))
+
+    if not benchmark_hist.empty:
+        benchmark_window = benchmark_hist.loc[benchmark_hist.index >= common_start]
+        if not benchmark_window.empty:
+            benchmark_indexed = benchmark_window["Close"] / benchmark_window["Close"].iloc[0] * 100
+            fig.add_trace(go.Scatter(
+                x=benchmark_window.index, y=benchmark_indexed, mode="lines", name=benchmark_name,
+                line=dict(color=THEME["amber"], width=2, dash="dot"),
+            ))
+    else:
+        st.caption(f"Could not load benchmark data for {benchmark_name} ({benchmark_ticker}).")
+
+    x_min = company_window.index.min() if not company_window.empty else None
+    x_max = company_window.index.max() if not company_window.empty else None
+    _add_event_shading(fig, x_min, x_max)
+
+    _apply_dark_theme(fig, f"{ticker} vs. {benchmark_name}: indexed return (start = 100)")
+    fig.update_layout(yaxis_title="Index (start = 100)", xaxis_title="Date")
+    return fig
+
+
+# ---------------------------------------------------------------------
+# Chart 2 — Revenue Trend
+# ---------------------------------------------------------------------
+def _build_revenue_chart(ticker: str, revenue: dict[pd.Timestamp, float], is_quarterly: bool) -> go.Figure:
+    periods = sorted(revenue)
+    values = [revenue[p] for p in periods]
+
+    yoy = []
+    for idx, p in enumerate(periods):
+        if idx == 0 or not revenue[periods[idx - 1]]:
+            yoy.append(None)
         else:
-            key = str(period)
-        values[key] = float(val)
-    return values
+            yoy.append((revenue[p] / revenue[periods[idx - 1]] - 1) * 100)
+
+    customdata = [[g] for g in yoy]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=periods, y=values, name="Revenue",
+        marker_color=THEME["blue"],
+        customdata=customdata,
+        hovertemplate="%{x|%b %Y}<br>Revenue: %{y:$,.0f}<br>YoY growth: %{customdata[0]:.1f}%<extra></extra>",
+    ))
+    _add_event_shading(fig, min(periods) if periods else None, max(periods) if periods else None)
+    granularity = "Quarterly" if is_quarterly else "Annual"
+    _apply_dark_theme(fig, f"{ticker}: revenue trend ({granularity})")
+    fig.update_layout(yaxis_title="Revenue ($)", xaxis_title="Period", showlegend=False)
+    return fig
 
 
-def _coerce_years(series: dict[str, float]) -> list[int]:
-    years: list[int] = []
-    for key in series:
-        if isinstance(key, int):
-            years.append(key)
-        elif isinstance(key, str):
-            digits = "".join(ch for ch in key if ch.isdigit())[:4]
-            if digits:
-                years.append(int(digits))
-    return sorted(set(years))
-
-
-def _get_company_snapshot(ticker: str) -> dict:
-    company = yf.Ticker(ticker)
-    info = company.get_info() or {}
-    hist = company.history(period="max", auto_adjust=True)
-    hist = hist[["Close"]].dropna().copy()
-    hist.index = pd.to_datetime(hist.index)
-    hist.index = hist.index.tz_convert(None) if getattr(hist.index, "tz", None) is not None else hist.index
-    hist = hist.sort_index()
-
-    financials = company.financials
-    cashflow = company.cashflow
-    quarterly_financials = company.quarterly_financials
-    quarterly_cashflow = company.quarterly_cashflow
-
-    revenue_series = _extract_series(financials, "Total Revenue")
-    if not revenue_series:
-        revenue_series = _extract_series(quarterly_financials, "Total Revenue")
-
-    free_cash_flow_series = {}
-    for row_name in ["Free Cash Flow", "Capital Expenditure", "Operating Cash Flow"]:
-        candidate = _extract_series(cashflow, row_name)
-        if candidate:
-            free_cash_flow_series = candidate
-            break
-    if not free_cash_flow_series:
-        for row_name in ["Free Cash Flow", "Capital Expenditure", "Operating Cash Flow"]:
-            candidate = _extract_series(quarterly_cashflow, row_name)
-            if candidate:
-                free_cash_flow_series = candidate
-                break
-
-    if free_cash_flow_series and revenue_series:
-        periods = sorted(set(free_cash_flow_series) & set(revenue_series))
-        revenue_periods = {p: revenue_series[p] for p in periods}
-        fcf_periods = {p: free_cash_flow_series[p] for p in periods}
-        fcf_margin_series = {p: (fcf_periods[p] / revenue_periods[p]) * 100 for p in periods if revenue_periods[p] not in (0, None)}
-    else:
-        fcf_margin_series = {}
-
-    return {
-        "info": info,
-        "hist": hist,
-        "revenue_series": revenue_series,
-        "fcf_series": free_cash_flow_series,
-        "fcf_margin_series": fcf_margin_series,
-        "company_currency": info.get("financialCurrency") or info.get("currency") or "USD",
-    }
-
-
-@st.cache_data(show_spinner="Fetching company data...", ttl=60 * 60)
-def _load_cached_snapshot(ticker: str) -> dict:
-    return _get_company_snapshot(ticker)
-
-
-def classify_closing_gap(fcf_margin_series: list[float], periods: list[str]) -> tuple[str, list[str]]:
-    latest = periods[-4:]
-    if len(latest) < 4:
-        return "Not yet closing the gap", []
-
-    values_by_period = {period: fcf_margin_series[idx] for idx, period in enumerate(periods)}
-    improvements = []
-    for idx in range(1, len(latest)):
-        previous = values_by_period[latest[idx - 1]]
-        current = values_by_period[latest[idx]]
-        if current > previous:
-            improvements.append(latest[idx])
-
-    if len(improvements) >= 3:
-        return "Closing the gap", improvements
-    return "Not yet closing the gap", []
-
-
-def _build_price_return_chart(hist: pd.DataFrame, ipo_date: str | None, ticker: str) -> go.Figure:
-    horizons = ["Since IPO", "3Y", "1Y", "YTD"]
-    horizon = st.radio("Time horizon", horizons, horizontal=True, key=f"{ticker}_horizon")
-    latest_date = hist.index.max()
-
-    if horizon == "Since IPO":
-        anchor = pd.to_datetime(ipo_date) if ipo_date else hist.index.min()
-    elif horizon == "3Y":
-        anchor = latest_date - pd.DateOffset(years=3)
-    elif horizon == "1Y":
-        anchor = latest_date - pd.DateOffset(years=1)
-    else:
-        anchor = pd.Timestamp(year=latest_date.year, month=1, day=1)
-
-    if getattr(hist.index, "tz", None) is not None:
-        hist = hist.copy()
-        hist.index = hist.index.tz_convert(None)
-
-    anchor = pd.Timestamp(anchor).tz_localize(None) if getattr(anchor, "tzinfo", None) is not None else pd.Timestamp(anchor)
-    window = hist.loc[hist.index >= anchor]
-    if window.empty:
-        window = hist
-
-    window = window.copy()
-    window.index = pd.to_datetime(window.index)
-    window = window.loc[window.index >= window.index.min()]
-    first_value = window.iloc[0]["Close"]
-    indexed = window["Close"] / first_value * 100.0
+# ---------------------------------------------------------------------
+# Chart 3 — Operating Margin Trend
+# ---------------------------------------------------------------------
+def _build_operating_margin_chart(ticker: str, operating_margin: dict[pd.Timestamp, float]) -> go.Figure:
+    periods = sorted(operating_margin)
+    values = [operating_margin[p] for p in periods]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=window.index, y=indexed, mode="lines", name="Indexed price",
-        line=dict(color="#8fbcff", width=3),
-        fill="tozeroy", fillcolor="rgba(143,188,255,0.12)",
+        x=periods, y=values, mode="lines+markers", name="Operating margin",
+        line=dict(color=THEME["red"], width=3),
+        marker=dict(color=THEME["red"], size=7),
+        hovertemplate="%{x|%b %Y}<br>Operating margin: %{y:.1f}%<extra></extra>",
     ))
-    fig.add_vrect(x0=pd.Timestamp("2021-01-01"), x1=pd.Timestamp("2022-12-31"), fillcolor="#ff7a72", opacity=0.12, line_width=0)
-    fig.update_layout(
-        title=f"{ticker}: indexed price return",
-        xaxis_title="Date",
-        yaxis_title="Index (start = 100)",
-        template="plotly_dark",
-        paper_bgcolor="#151b28",
-        plot_bgcolor="#151b28",
-        font=dict(color="#e9edf5"),
-        margin=dict(t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        xaxis=dict(range=[window.index.min(), window.index.max()], gridcolor="#2a3345"),
-        yaxis=dict(gridcolor="#2a3345"),
-    )
+    fig.add_hline(y=0, line_dash="dash", line_color=THEME["muted"])
+    _add_event_shading(fig, min(periods) if periods else None, max(periods) if periods else None)
+    _apply_dark_theme(fig, f"{ticker}: operating margin trend")
+    fig.update_layout(yaxis_title="Operating margin (%)", xaxis_title="Period", showlegend=False)
     return fig
 
 
-def _build_fundamentals_chart(revenue_series: dict[str, float], fcf_margin_series: dict[str, float], ticker: str) -> go.Figure:
-    periods = sorted(set(revenue_series) & set(fcf_margin_series))
-    if len(periods) < 2:
-        periods = sorted(set(revenue_series) | set(fcf_margin_series))
+# ---------------------------------------------------------------------
+# Chart 4 — Cash Balance vs. Cash Burn
+# ---------------------------------------------------------------------
+def _build_cash_chart(
+    ticker: str,
+    cash_balance: dict[pd.Timestamp, float],
+    free_cash_flow: dict[pd.Timestamp, float],
+    runway_years: float | None,
+    is_cash_generating: bool,
+) -> go.Figure:
+    """
+    Single-axis cash balance line. Each actual data point is colored by
+    that period's burn state (red = burning cash, green = cash
+    generating, gray = burn data unavailable for that period) so the
+    per-period detail survives without a second y-axis. If the company
+    is burning cash, a shaded, dashed projection extends the line to
+    where it would hit zero at the current burn rate.
+    """
+    periods = sorted(cash_balance)
+    values = [cash_balance[p] for p in periods]
 
-    revenue_growth = []
-    for idx, period in enumerate(periods):
-        if idx == 0:
-            revenue_growth.append(None)
-            continue
-        prev_period = periods[idx - 1]
-        prev_value = revenue_series[prev_period]
-        current_value = revenue_series[period]
-        if prev_value in (0, None):
-            revenue_growth.append(None)
-        else:
-            revenue_growth.append((current_value / prev_value - 1) * 100)
+    def burn_color(period: pd.Timestamp) -> str:
+        fcf = free_cash_flow.get(period)
+        if fcf is None:
+            return THEME["muted"]
+        return THEME["green"] if fcf >= 0 else THEME["red"]
+
+    def burn_label(period: pd.Timestamp) -> str:
+        fcf = free_cash_flow.get(period)
+        if fcf is None:
+            return "burn data unavailable"
+        return "cash generating" if fcf >= 0 else "burning cash"
+
+    point_colors = [burn_color(p) for p in periods]
+    customdata = [[burn_label(p)] for p in periods]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=periods, y=[fcf_margin_series.get(p) for p in periods], mode="lines+markers", name="FCF margin (%)", yaxis="y1", line=dict(color="#ff7a72", width=2), marker=dict(color="#ff7a72")))
-    fig.add_trace(go.Scatter(x=periods, y=revenue_growth, mode="lines+markers", name="Revenue growth YoY (%)", yaxis="y2", line=dict(color="#8fbcff", width=2), marker=dict(color="#8fbcff")))
+    fig.add_trace(go.Scatter(
+        x=periods, y=values, mode="lines+markers", name="Cash balance",
+        line=dict(color=THEME["blue"], width=2),
+        marker=dict(color=point_colors, size=10, line=dict(width=1, color=THEME["bg"])),
+        customdata=customdata,
+        hovertemplate="%{x|%b %Y}<br>Cash balance: %{y:$,.0f}<br>%{customdata[0]}<extra></extra>",
+    ))
+
+    if periods and not is_cash_generating and runway_years:
+        last_period, last_value = periods[-1], values[-1]
+        # Cap the projected horizon so a very long runway doesn't stretch
+        # the x-axis absurdly; note in the label when we've capped it.
+        span_years = max((periods[-1] - periods[0]).days / 365.25, 1)
+        display_years = min(runway_years, span_years * 1.5, 8)
+        capped = display_years < runway_years
+        projected_date = last_period + pd.DateOffset(days=int(display_years * 365.25))
+        projected_value = 0 if not capped else last_value * (1 - display_years / runway_years)
+
+        fig.add_trace(go.Scatter(
+            x=[last_period, projected_date], y=[last_value, projected_value],
+            mode="lines", name="Projected runway",
+            line=dict(color=THEME["blue"], width=2, dash="dot"),
+            fill="tozeroy", fillcolor=THEME["blue_fill"],
+            hoverinfo="skip",
+        ))
+        label = (
+            f"Runway exceeds {display_years:.0f} yrs (chart capped)"
+            if capped else f"Projected cash-out: ~{runway_years:.1f} yrs"
+        )
+        fig.add_annotation(
+            x=projected_date, y=projected_value,
+            text=label, showarrow=True, arrowhead=2, ax=0, ay=-30,
+            font=dict(size=10, color=THEME["text"]),
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color=THEME["muted"])
+    _add_event_shading(fig, periods[0] if periods else None, periods[-1] if periods else None)
+    _apply_dark_theme(fig, f"{ticker}: cash balance and runway")
+    fig.update_layout(xaxis_title="Period", yaxis_title="Cash balance ($)", showlegend=False)
+    return fig
+
+
+# ---------------------------------------------------------------------
+# Chart 5 — Peer Comparison
+# ---------------------------------------------------------------------
+def _axis_bounds(values: list[float], pad_frac: float = 0.20) -> tuple[float, float]:
+    """
+    Robust axis bounds using Tukey's IQR fences, so one or two extreme
+    outliers (e.g. a company whose revenue growth is +2000% off a tiny
+    base) don't compress the rest of the peer set into a corner. Points
+    outside these bounds get pulled to the edge by _clip_point below.
+    """
+    series = pd.Series([v for v in values if v is not None])
+    if len(series) < 4:
+        lo, hi = float(series.min()), float(series.max())
+        pad = (hi - lo) * pad_frac or 10
+        return lo - pad, hi + pad
+
+    q1, q3 = series.quantile([0.25, 0.75])
+    iqr = (q3 - q1) or (series.max() - series.min()) or 10
+    fence_lo, fence_hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    lo = max(fence_lo, series.min())
+    hi = min(fence_hi, series.max())
+    pad = (hi - lo) * pad_frac or 10
+    return lo - pad, hi + pad
+
+
+def _clip_point(x, y, x_bounds, y_bounds, inset_frac: float = 0.12):
+    """
+    Pulls an out-of-range point to just inside the axis edge (rather than
+    exactly on it, so its marker isn't cut off) and returns the display
+    coordinates plus a directional triangle marker symbol indicating
+    which way the true value lies off-chart.
+    """
+    x_lo, x_hi = x_bounds
+    y_lo, y_hi = y_bounds
+    x_pad, y_pad = (x_hi - x_lo) * inset_frac, (y_hi - y_lo) * inset_frac
+
+    dx = 1 if x > x_hi else (-1 if x < x_lo else 0)
+    dy = 1 if y > y_hi else (-1 if y < y_lo else 0)
+
+    disp_x = (x_hi - x_pad) if dx == 1 else (x_lo + x_pad) if dx == -1 else x
+    disp_y = (y_hi - y_pad) if dy == 1 else (y_lo + y_pad) if dy == -1 else y
+
+    symbol_map = {
+        (0, 0): "circle",
+        (1, 0): "triangle-right", (-1, 0): "triangle-left",
+        (0, 1): "triangle-up", (0, -1): "triangle-down",
+        (1, 1): "triangle-ne", (1, -1): "triangle-se",
+        (-1, 1): "triangle-nw", (-1, -1): "triangle-sw",
+    }
+    return disp_x, disp_y, symbol_map[(dx, dy)], bool(dx or dy)
+
+
+def _peer_trace(rows: list[dict], x_bounds, y_bounds, *, muted: bool) -> go.Scatter:
+    disp_x, disp_y, symbols, texts, customdata = [], [], [], [], []
+    for r in rows:
+        dx, dy, symbol, clipped = _clip_point(r["growth"], r["margin"], x_bounds, y_bounds)
+        disp_x.append(dx)
+        disp_y.append(dy)
+        symbols.append(symbol)
+        texts.append(r["ticker"])
+        customdata.append([r["name"], r["category"], r["growth"], r["margin"], "yes" if clipped else "no"])
+
+    color = THEME["muted"] if muted else THEME["blue"]
+    size = 12 if muted else 18
+    return go.Scatter(
+        x=disp_x, y=disp_y,
+        mode="markers+text",
+        text=texts,
+        textposition="top center",
+        textfont=dict(size=10 if muted else 12, color=color if muted else THEME["blue"]),
+        marker=dict(
+            size=size, color=color, opacity=0.6 if muted else 1.0,
+            symbol=symbols, line=dict(width=0 if muted else 2, color="white"),
+        ),
+        customdata=customdata,
+        hovertemplate=(
+            "%{customdata[0]} (%{customdata[1]})"
+            "<br>Revenue growth: %{customdata[2]:.1f}%"
+            "<br>Operating margin: %{customdata[3]:.1f}%"
+            "<br>Off-scale, pulled to edge: %{customdata[4]}"
+            "<extra></extra>"
+        ),
+    )
+
+
+def _build_peer_comparison_chart(selected_ticker: str) -> go.Figure:
+    rows = []
+    for ticker, meta in SPACE_COMPANIES.items():
+        try:
+            growth, margin = peer_growth_margin(ticker)
+        except Exception:
+            growth, margin = None, None
+        if growth is None or margin is None:
+            continue
+        rows.append({
+            "ticker": ticker,
+            "name": meta["name"],
+            "category": meta["category"],
+            "growth": growth,
+            "margin": margin,
+        })
+
+    fig = go.Figure()
+    if not rows:
+        _apply_dark_theme(fig, "Growth vs. operating margin — peer comparison")
+        return fig
+
+    x_bounds = _axis_bounds([r["growth"] for r in rows])
+    y_bounds = _axis_bounds([r["margin"] for r in rows])
+
+    others = [r for r in rows if r["ticker"] != selected_ticker]
+    selected = [r for r in rows if r["ticker"] == selected_ticker]
+
+    if others:
+        fig.add_trace(_peer_trace(others, x_bounds, y_bounds, muted=True))
+    if selected:
+        fig.add_trace(_peer_trace(selected, x_bounds, y_bounds, muted=False))
+
+    fig.add_hline(y=0, line_dash="dash", line_color=THEME["grid"])
+    fig.add_vline(x=0, line_dash="dash", line_color=THEME["grid"])
+    _apply_dark_theme(fig, "Growth vs. operating margin — peer comparison")
     fig.update_layout(
-        title=f"{ticker}: fundamentals trend",
-        template="plotly_dark",
-        paper_bgcolor="#151b28",
-        plot_bgcolor="#151b28",
-        font=dict(color="#e9edf5"),
-        yaxis=dict(title="FCF margin (%)", showgrid=False),
-        yaxis2=dict(title="Revenue growth YoY (%)", overlaying="y", side="right", showgrid=False),
-        margin=dict(t=50, b=20),
+        xaxis=dict(title="Revenue growth (%, latest period)", range=x_bounds, gridcolor=THEME["grid"]),
+        yaxis=dict(title="Operating margin (%, latest period)", range=y_bounds, gridcolor=THEME["grid"]),
+        showlegend=False,
     )
     return fig
 
 
-def _build_narrative_chart(ticker: str, years: list[int], revenue_series: list[float], price_series: list[float], narrative_cagr: float) -> go.Figure:
-    fig = build_narrative_gap_chart(
-        ticker=ticker,
-        years=years,
-        revenue=revenue_series,
-        price=price_series,
-        narrative_cagr=narrative_cagr,
-        start_year=years[0],
-        bubble_band=(2021, 2022),
-    )
-    # narrative.py builds this figure with its own trace colors, so we only
-    # override the theme-level settings here rather than individual traces.
-    fig.update_layout(
-        title=f"{ticker}: narrative vs. fundamentals vs. price",
-        template="plotly_dark",
-        paper_bgcolor="#151b28",
-        plot_bgcolor="#151b28",
-        font=dict(color="#e9edf5"),
-    )
-    return fig
-
-
+# ---------------------------------------------------------------------
+# Main render function
+# ---------------------------------------------------------------------
 def render_deep_dive(stock: dict):
     """Render the evidence-driven deep-dive screen for a company."""
     if st.button("← Back to orbital map"):
@@ -273,164 +462,133 @@ def render_deep_dive(stock: dict):
         st.rerun()
 
     ticker = stock["ticker"]
+
     try:
-        snapshot = _load_cached_snapshot(ticker)
+        hist = load_full_price_history(ticker)
     except Exception as exc:
-        st.warning(f"Could not fetch live data for {ticker}: {exc}. Showing the screen with placeholders instead.")
-        snapshot = {
-            "info": {},
-            "hist": pd.DataFrame(columns=["Close"]),
-            "revenue_series": {},
-            "fcf_series": {},
-            "fcf_margin_series": {},
-            "company_currency": "USD",
+        st.warning(f"Could not fetch price history for {ticker}: {exc}")
+        hist = pd.DataFrame(columns=["Close"])
+
+    try:
+        fundamentals = load_company_fundamentals(ticker)
+    except Exception as exc:
+        st.warning(f"Could not fetch fundamentals for {ticker}: {exc}")
+        fundamentals = {
+            "info": {}, "revenue": {}, "operating_income": {}, "operating_margin": {},
+            "net_income": {}, "cash_balance": {}, "free_cash_flow": {},
+            "is_quarterly": False, "cash_is_quarterly": False, "currency": "USD",
         }
-    info = snapshot["info"]
-    hist = snapshot["hist"]
-    revenue_series = snapshot["revenue_series"]
-    fcf_series = snapshot["fcf_series"]
-    fcf_margin_series = snapshot["fcf_margin_series"]
-    company_currency = snapshot["company_currency"]
 
-    st.title(f"{ticker} — {stock['name']}")
-    st.caption(
-        f"{_infer_company_tier(stock)} · IPO {stock.get('ipo_date', 'unknown')} · {_infer_listing_method(stock)}"
-    )
+    info = fundamentals["info"]
+    revenue = fundamentals["revenue"]
+    operating_margin = fundamentals["operating_margin"]
+    net_income = fundamentals["net_income"]
+    cash_balance = fundamentals["cash_balance"]
+    free_cash_flow = fundamentals["free_cash_flow"]
+    is_quarterly = fundamentals["is_quarterly"]
 
-    latest_price = hist["Close"].iloc[-1] if not hist.empty else None
-    latest_revenue = None
-    if revenue_series:
-        latest_revenue = list(revenue_series.values())[-1]
+    company_meta = SPACE_COMPANIES.get(ticker, {})
+    category = company_meta.get("category", "Space Economy")
 
-    market_cap = info.get("marketCap")
-    if market_cap is None and stock.get("market_cap"):
-        market_cap = stock["market_cap"]
+    st.title(f"{ticker} — {stock.get('name', company_meta.get('name', ticker))}")
+    st.caption(f"{category} · IPO {stock.get('ipo_date', 'unknown')}")
 
-    latest_fcf = None
-    if fcf_series:
-        latest_fcf = list(fcf_series.values())[-1]
+    # ---- KPIs ----
+    market_cap = info.get("marketCap") or stock.get("market_cap")
+    revenue_growth = latest_revenue_growth(revenue)
+    op_margin_latest = latest_operating_margin(operating_margin)
+    net_income_latest = latest_value(net_income)
+    cash_latest = latest_value(cash_balance)
+    fcf_latest = latest_value(free_cash_flow)
+    runway_years, is_cash_generating = compute_cash_runway(cash_latest, fcf_latest, is_quarterly)
 
-    revenue_growth = None
-    if len(revenue_series) >= 2:
-        sorted_periods = sorted(revenue_series)
-        recent = sorted_periods[-1]
-        previous = sorted_periods[-2]
-        if revenue_series[previous] not in (0, None):
-            revenue_growth = (revenue_series[recent] / revenue_series[previous] - 1) * 100
-
-    price_to_sales = None
-    if market_cap and latest_revenue not in (None, 0):
-        price_to_sales = market_cap / latest_revenue
-    elif info.get("priceToSalesTrailing12Months"):
-        price_to_sales = info.get("priceToSalesTrailing12Months")
-
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.html(f"""
-            <div>
-            <div style="font-size:0.9rem;">Market cap</div>
-            <div style="font-size:2.5rem;font-weight:600; color: white">{_format_currency(market_cap)}</div>
-            </div>
-            """)
+        <div>
+        <div style="font-size:0.9rem;">Market cap</div>
+        <div style="font-size:2.2rem;font-weight:600;color:white">{_format_currency(market_cap)}</div>
+        </div>
+        """)
     c2.html(f"""
         <div>
-        <div style="font-size:0.9rem;">Free cash flow</div>
-        <div style="font-size:2.5rem;font-weight:600;
-                    color:{'green' if latest_fcf >= 0 else 'red'}">
-            {_format_currency(latest_fcf)}
-        </div>
+        <div style="font-size:0.9rem;">Revenue growth</div>
+        <div style="font-size:2.2rem;font-weight:600;color:{_kpi_color(revenue_growth)}">{_format_pct(revenue_growth)}</div>
         </div>
         """)
     c3.html(f"""
-    <div>
-    <div style="font-size:0.9rem;">Revenue growth YoY</div>
-    <div style="font-size:2.5rem;font-weight:600;
-                color:{'green' if revenue_growth >= 0 else 'red'}">
-        {_format_pct(revenue_growth)}
-    </div>
-    </div>
-    """)
+        <div>
+        <div style="font-size:0.9rem;">Operating margin</div>
+        <div style="font-size:2.2rem;font-weight:600;color:{_kpi_color(op_margin_latest)}">{_format_pct(op_margin_latest)}</div>
+        </div>
+        """)
     c4.html(f"""
-            <div>
-            <div style="font-size:0.9rem;">Price/sales</div>
-            <div style="font-size:2.5rem;font-weight:600; color: white">{_format_ratio(price_to_sales)}</div>
-            </div>
-            """)
+        <div>
+        <div style="font-size:0.9rem;">Net income</div>
+        <div style="font-size:2.2rem;font-weight:600;color:{_kpi_color(net_income_latest)}">{_format_currency(net_income_latest)}</div>
+        </div>
+        """)
+    c5.html(f"""
+        <div>
+        <div style="font-size:0.9rem;">Cash runway</div>
+        <div style="font-size:2.2rem;font-weight:600;color:white">{_format_runway(runway_years, is_cash_generating)}</div>
+        </div>
+        """)
 
     st.divider()
 
-    st.subheader("Price return chart")
-    fig_price = _build_price_return_chart(hist, stock.get("ipo_date"), ticker)
-    st.plotly_chart(fig_price, use_container_width=True)
-    st.caption("The return window changes the conclusion, which is the point of the toggle.")
-
-    st.subheader("Narrative vs. fundamentals vs. price")
-    narrative_cagr = narrative_cagr_from_config()
-    if hist.empty or not revenue_series:
-        st.warning("The available data for this ticker is incomplete, so the chart is shown as a placeholder until more fundamentals are available.")
-        years = list(range(2020, 2026))
-        revenue_series_placeholder = [100 + i * 8 for i in range(len(years))]
-        price_series_placeholder = [100 + i * 10 for i in range(len(years))]
-        st.plotly_chart(_build_narrative_chart(ticker, years, revenue_series_placeholder, price_series_placeholder, narrative_cagr), use_container_width=True)
+    # ---- Chart 1: Stock Performance ----
+    st.subheader("Stock performance")
+    st.caption("Have investors actually been rewarded?")
+    if hist.empty:
+        st.info("No price history available for this ticker.")
     else:
-        years = _coerce_years(revenue_series)
-        if not years:
-            years = list(range(2020, 2026))
-        revenue_by_year = {}
-        for key, value in revenue_series.items():
-            year = None
-            if isinstance(key, int):
-                year = key
-            elif isinstance(key, str):
-                digits = "".join(ch for ch in key if ch.isdigit())[:4]
-                if digits:
-                    year = int(digits)
-            if year is not None:
-                revenue_by_year[year] = value
+        st.plotly_chart(_build_stock_performance_chart(ticker, hist), width='stretch')
 
-        if years and len(years) >= 2:
-            base_revenue = revenue_by_year.get(years[0])
-            if base_revenue in (None, 0):
-                base_revenue = next((value for value in revenue_by_year.values() if value not in (None, 0)), 1.0)
-            revenue_indexed = [revenue_by_year.get(year, 0) / base_revenue * 100 if base_revenue not in (None, 0) else 100 for year in years]
-            yearly_prices = hist.groupby(hist.index.year)["Close"].last()
-            price_indexed = []
-            for year in years:
-                price = yearly_prices.get(year)
-                if price is None:
-                    price_indexed.append(None)
-                else:
-                    price_indexed.append(price)
-            first_price = next((value for value in price_indexed if value is not None), None)
-            if first_price is not None:
-                price_indexed = [100.0 if value is None else (value / first_price * 100.0) for value in price_indexed]
-            else:
-                price_indexed = [100.0 for _ in years]
-            fig_narrative = _build_narrative_chart(ticker, years, revenue_indexed, price_indexed, narrative_cagr)
-            st.plotly_chart(fig_narrative, use_container_width=True)
-        else:
-            st.info("Not enough aligned annual data to plot the narrative chart yet.")
+    st.divider()
 
-    if company_currency and company_currency != NARRATIVE_FORECAST["currency"]:
-        st.caption(f"The narrative forecast is configured in {NARRATIVE_FORECAST['currency']}; the company currency is {company_currency}, so the chart reflects the configured conversion rate explicitly.")
+    # ---- Chart 2: Revenue Trend ----
+    st.subheader("Revenue trend")
+    st.caption("Is the business actually growing?")
+    if not revenue:
+        st.info("Revenue data is not available for this ticker.")
     else:
-        st.caption(f"Narrative source: {NARRATIVE_FORECAST['citation']}.")
+        st.plotly_chart(_build_revenue_chart(ticker, revenue, is_quarterly), width='stretch')
 
-    st.subheader("Fundamentals trend")
-    if fcf_margin_series:
-        fig_fund = _build_fundamentals_chart(revenue_series, fcf_margin_series, ticker)
-        st.plotly_chart(fig_fund, use_container_width=True)
-    else:
-        st.info("Quarterly or annual fundamentals are not available for this ticker, so the trend view is limited to the data that could be fetched.")
+    st.divider()
 
-    st.subheader("Closing the gap")
-    periods = list(fcf_margin_series.keys())
-    if len(periods) >= 4:
-        status, improving_periods = classify_closing_gap(list(fcf_margin_series.values()), periods)
-        st.write(f"**{status}**")
-        if improving_periods:
-            st.caption(f"Periods driving the signal: {', '.join(improving_periods)}")
-        else:
-            st.caption("Rule: FCF margin must improve in at least 3 of the last 4 reporting periods.")
+    # ---- Chart 3: Operating Margin Trend ----
+    st.subheader("Operating margin trend")
+    st.caption("Is the company becoming more profitable?")
+    if not operating_margin:
+        st.info("Not enough aligned revenue and operating income data to chart margin trend.")
     else:
-        st.write("**Not yet closing the gap**")
-        st.caption("Insufficient reporting periods are available to apply the closing-gap rule.")
+        st.plotly_chart(_build_operating_margin_chart(ticker, operating_margin), width='stretch')
+
+    st.divider()
+
+    # ---- Chart 4: Cash Balance vs. Cash Burn ----
+    st.subheader("Cash balance and runway")
+    st.caption("Can the company sustain operations without raising more capital?")
+    if not cash_balance:
+        st.info("Cash balance data is not available for this ticker.")
+    else:
+        st.plotly_chart(
+            _build_cash_chart(ticker, cash_balance, free_cash_flow, runway_years, is_cash_generating),
+            width='stretch',
+        )
+        st.caption(
+            "🔴 burning cash that period · 🟢 cash generating that period · "
+            "shaded region = projected time to cash-out at the current burn rate."
+        )
+
+    st.divider()
+
+    # ---- Chart 5: Peer Comparison ----
+    st.subheader("Growth vs. valuation — peer comparison")
+    st.caption("How does this company compare with its peers?")
+    st.plotly_chart(_build_peer_comparison_chart(ticker), width='stretch')
+    st.caption(
+        "Axis range is set to where most peers cluster. Companies with extreme "
+        "growth or margin swings are pulled to the edge as a ▲ arrow pointing "
+        "toward their true value — hover over any point for the exact numbers."
+    )

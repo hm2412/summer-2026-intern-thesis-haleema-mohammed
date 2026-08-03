@@ -5,7 +5,7 @@ Calls into data.py / analysis.py / charts.py. No computation lives here —
 this file is purely: get inputs from the sidebar, call functions, render output.
 
 Run with: python -m streamlit run app.py
-"""
+
 import streamlit as st
 
 from data import (
@@ -158,3 +158,4 @@ with tab_vol:
         "Drag the range slider below the chart to zoom into a specific period. "
         "Manually-curated event markers land here next."
     )
+    """

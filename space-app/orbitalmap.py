@@ -1,137 +1,119 @@
 """
 Space economy — animated orbital map.
 
-  - planet size   = market cap (sqrt scale, clamped)
-  - orbit ring     = years to consensus profitability (3 discrete rings)
-  - orbit speed    = total return since IPO relative to a growth-narrative
-                     benchmark. All planets orbit the same direction
-                     (clockwise); FAST = beating the narrative, SLOW =
-                     lagging it. Stroke color (green/red) reinforces
-                     ahead/behind.
+  - planet size    = market cap (log scale, clamped)
+  - orbit distance  = profitability (operating margin, tanh-compressed,
+                       CONTINUOUS — close orbit = profitable, far orbit =
+                       loss-making; unknown margin is pushed to the outer
+                       edge and flagged rather than guessed)
+  - orbit speed     = 3-year revenue CAGR (fast = high growth)
+  - planet colour   = 3-year total shareholder return, diverging
+                       red -> green scale
+  - anywhere Yahoo Finance doesn't have enough history for a metric
+    (common for recently-listed / small-cap tickers), that metric is
+    left as None and the frontend renders it as grey / "insufficient
+    data" instead of a fabricated number.
 
 Clicking a planet is handled by a real bidirectional Streamlit component
 (see orbital_frontend/index.html) that reports the clicked ticker straight
-back to Python via Streamlit's component messaging protocol. An earlier
-version tried to navigate window.parent.location from inside the iframe —
-that's silently blocked by the sandbox Streamlit renders custom HTML in,
-which is why clicks did nothing. declare_component() sidesteps that
-entirely: no navigation happens, the click value is just passed back.
+back to Python via Streamlit's component messaging protocol.
 
 Run with:  streamlit run orbital_map.py
 """
 
+import math
 import os
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 from deepdive import render_deep_dive
+import data
 
 _FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "orbital_frontend")
 _orbital_component = components.declare_component("orbital_map", path=_FRONTEND_DIR)
 
-# --------------------------------------------------------------------------
-# Sample data — replace with your real, computed dataset once that
-# pipeline is built. Numbers below are illustrative placeholders.
-# --------------------------------------------------------------------------
 
-SAMPLE_STOCKS = [
-    {
-        "ticker": "IRDM", "name": "Iridium Communications",
-        "market_cap": 4.2e9, "years_to_profitability": None,
-        "is_profitable_now": True, "return_since_ipo_pct": 45,
-        "benchmark_return_pct": 60, "tier": "mature", "ipo_date": "2009-02-01",
-        "listing_method": "Traditional", "sector_tier": "Prime",
-    },
-    {
-        "ticker": "LMT", "name": "Lockheed Martin",
-        "market_cap": 110e9, "years_to_profitability": None,
-        "is_profitable_now": True, "return_since_ipo_pct": 180,
-        "benchmark_return_pct": 60, "tier": "mature", "ipo_date": "1995-03-01",
-        "listing_method": "Traditional", "sector_tier": "Prime",
-    },
-    {
-        "ticker": "RKLB", "name": "Rocket Lab",
-        "market_cap": 14e9, "years_to_profitability": 1.5,
-        "is_profitable_now": False, "return_since_ipo_pct": 210,
-        "benchmark_return_pct": 90, "tier": "scaling", "ipo_date": "2021-08-25",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "LUNR", "name": "Intuitive Machines",
-        "market_cap": 1.1e9, "years_to_profitability": 2,
-        "is_profitable_now": False, "return_since_ipo_pct": -35,
-        "benchmark_return_pct": 90, "tier": "scaling", "ipo_date": "2023-02-13",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "PL", "name": "Planet Labs",
-        "market_cap": 2.6e9, "years_to_profitability": 1,
-        "is_profitable_now": False, "return_since_ipo_pct": 15,
-        "benchmark_return_pct": 90, "tier": "scaling", "ipo_date": "2021-12-08",
-        "listing_method": "Traditional", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "ASTS", "name": "AST SpaceMobile",
-        "market_cap": 9.5e9, "years_to_profitability": 4,
-        "is_profitable_now": False, "return_since_ipo_pct": 650,
-        "benchmark_return_pct": 90, "tier": "speculative", "ipo_date": "2021-04-06",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "RDW", "name": "Redwire",
-        "market_cap": 1.3e9, "years_to_profitability": None,
-        "is_profitable_now": False, "return_since_ipo_pct": -60,
-        "benchmark_return_pct": 90, "tier": "speculative", "ipo_date": "2021-09-02",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "SPCE", "name": "Virgin Galactic",
-        "market_cap": 0.3e9, "years_to_profitability": None,
-        "is_profitable_now": False, "return_since_ipo_pct": -97,
-        "benchmark_return_pct": 90, "tier": "speculative", "ipo_date": "2019-10-28",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-    {
-        "ticker": "BKSY", "name": "BlackSky",
-        "market_cap": 0.6e9, "years_to_profitability": None,
-        "is_profitable_now": False, "return_since_ipo_pct": -55,
-        "benchmark_return_pct": 90, "tier": "speculative", "ipo_date": "2021-09-09",
-        "listing_method": "SPAC-listed", "sector_tier": "Pure-play",
-    },
-]
+@st.cache_data(ttl=60 * 60, show_spinner="Loading live financials...")
+def _load_live_planet_data() -> list[dict]:
+    """
+    Builds the per-planet dataset from live Yahoo Finance data via
+    data.py, one company at a time. Every metric that Yahoo Finance
+    doesn't have enough history to support for a given ticker is left
+    as None (never estimated) — the frontend is responsible for
+    rendering that as "insufficient data".
+    """
+    planets = []
+    for ticker, meta in data.SPACE_COMPANIES.items():
+        fundamentals = data.load_company_fundamentals(ticker)
+        info = fundamentals["info"]
 
+        market_cap = info.get("marketCap")
 
-def _compute_ring(years_to_profitability, is_profitable_now):
-    if is_profitable_now:
-        return 0
-    if years_to_profitability is None:
-        return 2
-    if years_to_profitability <= 3:
-        return 1
-    return 2
+        operating_margin_pct = data.latest_operating_margin(fundamentals["operating_margin"])
+        profitability_score = (
+            math.tanh(operating_margin_pct / 100) if operating_margin_pct is not None else None
+        )
 
+        annual_revenue = data.load_annual_revenue(ticker)
+        revenue_cagr_pct = data.compute_revenue_cagr(annual_revenue, years=3)
 
-def _prepare_data(stocks):
-    prepared = []
-    for s in stocks:
-        relative_return = s["return_since_ipo_pct"] - s["benchmark_return_pct"]
-        prepared.append({
-            **s,
-            "ring": _compute_ring(s.get("years_to_profitability"), s.get("is_profitable_now", False)),
-            "relative_return_pct": relative_return,
+        price_history = data.load_full_price_history(ticker)
+        tsr_3y_pct = data.compute_total_shareholder_return(price_history, years=3)
+        ipo_date = (
+            price_history.index.min().strftime("%Y-%m-%d")
+            if not price_history.empty else "unknown"
+        )
+
+        cash_balance = data.latest_value(fundamentals["cash_balance"])
+        free_cash_flow = data.latest_value(fundamentals["free_cash_flow"])
+        cash_runway_years, is_cash_generating = data.compute_cash_runway(
+            cash_balance, free_cash_flow, fundamentals["is_quarterly"]
+        )
+
+        planets.append({
+            "ticker": ticker,
+            "name": meta["name"],
+            "category": meta["category"],
+            "market_cap": market_cap,
+            "ipo_date": ipo_date,
+            "operating_margin_pct": operating_margin_pct,
+            "profitability_score": profitability_score,
+            "revenue_cagr_pct": revenue_cagr_pct,
+            "tsr_3y_pct": tsr_3y_pct,
+            "cash_runway_years": cash_runway_years,
+            "is_cash_generating": is_cash_generating,
         })
-    return prepared
+    return planets
 
 
-def render_orbital_map(stocks, height=850, key="orbital_map"):
+# ---------------------------------------------------------------------
+# Sector KPI strip — the panel itself is rendered inside the HTML
+# component (orbital_frontend/index.html) so the universe toggle is
+# instant with no Streamlit rerun. The only thing Python needs to supply
+# is the S&P 500 benchmark return, since that's independent of the
+# per-company `planets` data already being passed to the component.
+# ---------------------------------------------------------------------
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _load_benchmark_return(ticker: str = "SPY", years: int = 3) -> float | None:
+    """S&P 500's 3-year total return, computed once — independent of the
+    pure-play/all-companies universe toggle."""
+    hist = data.load_full_price_history(ticker)
+    return data.compute_total_shareholder_return(hist, years=years)
+
+
+def render_orbital_map(stocks, height=850, benchmark_tsr=None, key="orbital_map"):
     """
-    Renders the animated orbital map and returns the clicked ticker (a str),
-    or None if nothing has been clicked yet. The return value is exactly
-    what the frontend's setComponentValue(ticker) call sends back.
+    Renders the animated orbital map, including the sector KPI panel
+    (which lives inside the component itself and updates purely
+    client-side when the universe toggle is clicked — no Streamlit
+    rerun). Returns the clicked ticker (a str), or None if nothing has
+    been clicked yet — exactly what the frontend's setComponentValue(ticker)
+    call sends back.
     """
-    data = _prepare_data(stocks)
-    return _orbital_component(stocks=data, height=height, key=key, default=None)
+    return _orbital_component(
+        stocks=stocks, height=height, benchmark_tsr=benchmark_tsr, key=key, default=None
+    )
 
 
 def main():
@@ -157,9 +139,11 @@ def main():
     if "selected_ticker" not in st.session_state:
         st.session_state.selected_ticker = None
 
+    planets = _load_live_planet_data()
+
     if st.session_state.selected_ticker is not None:
         match = next(
-            (s for s in SAMPLE_STOCKS if s["ticker"] == st.session_state.selected_ticker),
+            (p for p in planets if p["ticker"] == st.session_state.selected_ticker),
             None,
         )
         if match is None:
@@ -170,11 +154,12 @@ def main():
 
     st.title("Space economy — orbital map")
     st.caption(
-        "Size = market cap · distance from sun = years to profitability · "
-        "orbit speed = ahead (fast) or behind (slow) the growth-narrative benchmark"
+        "Size = market cap · distance from sun = profitability (operating margin) · "
+        "orbit speed = 3-year revenue growth · colour = 3-year shareholder return"
     )
 
-    clicked = render_orbital_map(SAMPLE_STOCKS, height=850)
+    benchmark_tsr = _load_benchmark_return("SPY", years=3)
+    clicked = render_orbital_map(planets, height=850, benchmark_tsr=benchmark_tsr)
     if clicked:
         st.session_state.selected_ticker = clicked
         st.rerun()
