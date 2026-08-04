@@ -42,7 +42,7 @@ BENCHMARKS = {
     "S&P 500": "SPY",
     "Nasdaq Composite": "QQQ",
     "Procure Space ETF (UFO)": "UFO",
-    "ARK Space ETF (ARKX)": "ARKX",
+    "ARK Innovation ETF (ARKK)": "ARKK", #skibidi
     "iShares U.S. Aerospace & Defense ETF (ITA)": "ITA",
 }
 
@@ -343,9 +343,11 @@ def compute_revenue_cagr(revenue: dict[pd.Timestamp, float], years: int = 3) -> 
     company doesn't have that much history).
 
     Returns None — rather than a number computed from a shorter window —
-    if less than ~2.5 years actually separates the two periods used, so
-    a recently-listed company doesn't get a misleadingly-labelled
-    "3-year" growth rate built from one or two annual reports.
+    if the two periods used don't actually span close to the requested
+    window. The bar scales with `years` (roughly `years - 0.5`, floored
+    at 0.75) so a 1-year request isn't held to the same 2.5-year bar as
+    the 3-year default; a recently-listed company still won't get a
+    mislabeled "5-year" growth rate built from one or two annual reports.
     """
     if len(revenue) < 2:
         return None
@@ -356,7 +358,8 @@ def compute_revenue_cagr(revenue: dict[pd.Timestamp, float], years: int = 3) -> 
     start_period = max(earlier_candidates) if earlier_candidates else periods[0]
 
     span_years = (latest_period - start_period).days / 365.25
-    if span_years < 2.5:
+    min_span = max(years - 0.5, 0.75)
+    if span_years < min_span:
         return None
 
     start_val = revenue[start_period]

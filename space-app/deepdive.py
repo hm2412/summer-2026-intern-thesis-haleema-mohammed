@@ -43,7 +43,7 @@ THEME = {
 # dashboard requirements (BENCHMARKS in data.py has a couple of extras
 # used elsewhere in the app).
 CHART1_BENCHMARKS = {
-    name: BENCHMARKS[name] for name in ("S&P 500", "Nasdaq Composite", "ARK Space ETF (ARKX)")
+    name: BENCHMARKS[name] for name in ("S&P 500", "Nasdaq Composite", "ARK Innovation ETF (ARKK)") #skibidi
 }
 
 
@@ -92,8 +92,14 @@ def _apply_dark_theme(fig: go.Figure, title: str) -> go.Figure:
         paper_bgcolor=THEME["bg"],
         plot_bgcolor=THEME["bg"],
         font=dict(color=THEME["text"]),
-        margin=dict(t=70, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.1),
+        margin=dict(t=100, b=20),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=0.99,     # below the title
+            xanchor="left",
+            x=0,
+        ),
         xaxis=dict(gridcolor=THEME["grid"]),
         yaxis=dict(gridcolor=THEME["grid"]),
         hovermode="x unified",

@@ -33,6 +33,14 @@ import data
 _FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "orbital_frontend")
 _orbital_component = components.declare_component("orbital_map", path=_FRONTEND_DIR)
 
+# Year-window options the legend sliders can select between for revenue
+# growth and shareholder return. Precomputing all of them server-side
+# (cheap — reuses the annual_revenue / price_history already fetched per
+# company) means the slider can switch instantly in the browser with no
+# Streamlit round-trip.
+YEAR_WINDOW_OPTIONS = (1, 2, 3, 4, 5)
+DEFAULT_YEARS = 3
+
 
 @st.cache_data(ttl=60 * 60, show_spinner="Loading live financials...")
 def _load_live_planet_data() -> list[dict]:
@@ -56,10 +64,16 @@ def _load_live_planet_data() -> list[dict]:
         )
 
         annual_revenue = data.load_annual_revenue(ticker)
-        revenue_cagr_pct = data.compute_revenue_cagr(annual_revenue, years=3)
+        revenue_cagr_by_years = {
+            n: data.compute_revenue_cagr(annual_revenue, years=n) for n in YEAR_WINDOW_OPTIONS
+        }
+        revenue_cagr_pct = revenue_cagr_by_years[DEFAULT_YEARS]
 
         price_history = data.load_full_price_history(ticker)
-        tsr_3y_pct = data.compute_total_shareholder_return(price_history, years=3)
+        tsr_by_years = {
+            n: data.compute_total_shareholder_return(price_history, years=n) for n in YEAR_WINDOW_OPTIONS
+        }
+        tsr_3y_pct = tsr_by_years[DEFAULT_YEARS]
         ipo_date = (
             price_history.index.min().strftime("%Y-%m-%d")
             if not price_history.empty else "unknown"
@@ -80,7 +94,9 @@ def _load_live_planet_data() -> list[dict]:
             "operating_margin_pct": operating_margin_pct,
             "profitability_score": profitability_score,
             "revenue_cagr_pct": revenue_cagr_pct,
+            "revenue_cagr_by_years": revenue_cagr_by_years,
             "tsr_3y_pct": tsr_3y_pct,
+            "tsr_by_years": tsr_by_years,
             "cash_runway_years": cash_runway_years,
             "is_cash_generating": is_cash_generating,
         })
@@ -89,10 +105,11 @@ def _load_live_planet_data() -> list[dict]:
 
 # ---------------------------------------------------------------------
 # Sector KPI strip — the panel itself is rendered inside the HTML
-# component (orbital_frontend/index.html) so the universe toggle is
-# instant with no Streamlit rerun. The only thing Python needs to supply
-# is the S&P 500 benchmark return, since that's independent of the
-# per-company `planets` data already being passed to the component.
+# component (orbital_frontend/index.html) so both the universe toggle
+# and the growth/return year sliders are instant with no Streamlit
+# rerun. Python's job is just to supply the S&P 500 benchmark return for
+# every year option the slider can select, since that's independent of
+# the per-company `planets` data already being passed to the component.
 # ---------------------------------------------------------------------
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def _load_benchmark_return(ticker: str = "SPY", years: int = 3) -> float | None:
@@ -102,17 +119,24 @@ def _load_benchmark_return(ticker: str = "SPY", years: int = 3) -> float | None:
     return data.compute_total_shareholder_return(hist, years=years)
 
 
-def render_orbital_map(stocks, height=850, benchmark_tsr=None, key="orbital_map"):
+def render_orbital_map(
+    stocks, height=850, benchmark_tsr_by_years=None, arkk_tsr_by_years=None, key="orbital_map"
+):
     """
-    Renders the animated orbital map, including the sector KPI panel
-    (which lives inside the component itself and updates purely
-    client-side when the universe toggle is clicked — no Streamlit
-    rerun). Returns the clicked ticker (a str), or None if nothing has
-    been clicked yet — exactly what the frontend's setComponentValue(ticker)
-    call sends back.
+    Renders the animated orbital map, including the sector KPI panel and
+    the growth/return year-window sliders — all of which live inside the
+    component itself and update purely client-side (no Streamlit rerun).
+    benchmark_tsr_by_years is the S&P 500 comparison; arkk_tsr_by_years
+    is ARKK (a standard high-growth/pre-profit-stock proxy), shown
+    alongside it so the reader can judge whether the sector's return
+    pattern is space-specific or just how the market treats speculative
+    growth generally. Returns the clicked ticker (a str), or None if
+    nothing has been clicked yet — exactly what the frontend's
+    setComponentValue(ticker) call sends back.
     """
     return _orbital_component(
-        stocks=stocks, height=height, benchmark_tsr=benchmark_tsr, key=key, default=None
+        stocks=stocks, height=height, benchmark_tsr_by_years=benchmark_tsr_by_years,
+        arkk_tsr_by_years=arkk_tsr_by_years, key=key, default=None,
     )
 
 
@@ -152,14 +176,19 @@ def main():
         render_deep_dive(match)
         return
 
-    st.title("Space economy — orbital map")
-    st.caption(
-        "Size = market cap · distance from sun = profitability (operating margin) · "
-        "orbit speed = 3-year revenue growth · colour = 3-year shareholder return"
-    )
+    st.title("Mapping the space economy")
 
-    benchmark_tsr = _load_benchmark_return("SPY", years=3)
-    clicked = render_orbital_map(planets, height=850, benchmark_tsr=benchmark_tsr)
+    benchmark_tsr_by_years = {
+        n: _load_benchmark_return("SPY", years=n) for n in YEAR_WINDOW_OPTIONS
+    }
+    arkk_tsr_by_years = {
+        n: _load_benchmark_return("ARKK", years=n) for n in YEAR_WINDOW_OPTIONS
+    }
+    clicked = render_orbital_map(
+        planets, height=850,
+        benchmark_tsr_by_years=benchmark_tsr_by_years,
+        arkk_tsr_by_years=arkk_tsr_by_years,
+    )
     if clicked:
         st.session_state.selected_ticker = clicked
         st.rerun()

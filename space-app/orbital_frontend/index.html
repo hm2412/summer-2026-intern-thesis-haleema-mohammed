@@ -23,8 +23,16 @@
       <div style="font-weight:600;margin-bottom:4px;">Legend</div>
       <div>Size &mdash; market cap (log scale)</div>
       <div>Distance from sun &mdash; profitability (operating margin)</div>
-      <div>Orbit speed &mdash; 3-year revenue growth</div>
-      <div>Colour &mdash; 3-year shareholder return</div>
+      <div>Orbit speed &mdash; <span id="growth-years-label">3</span>-year revenue growth</div>
+      <div style="margin:3px 0 8px;display:flex;align-items:center;">
+        <input type="range" id="growth-years-slider" min="1" max="3" step="1" value="3"
+               style="width:100%;accent-color:#9aa6ff;height:14px;margin:0;">
+      </div>
+      <div>Colour &mdash; <span id="return-years-label">3</span>-year shareholder return</div>
+      <div style="margin:3px 0 8px;display:flex;align-items:center;">
+        <input type="range" id="return-years-slider" min="1" max="5" step="1" value="3"
+               style="width:100%;accent-color:#4fd1a5;height:14px;margin:0;">
+      </div>
       <div><span style="color:#2ecc71;">&#9679;</span> strong return &nbsp;
            <span style="color:#8b1a1a;">&#9679;</span> weak/negative return &nbsp;
            <span style="color:#6b7280;">&#9679;</span> no data</div>
@@ -65,7 +73,10 @@ let initialized = false;
 let lastStocksKey = null;
 let currentUniverse = "pure-play"; // "pure-play" | "all" — client-side only, no Streamlit rerun
 let currentStocks = [];
-let currentBenchmarkTsr = null;
+let currentBenchmarkTsrByYears = {};
+let currentArkkTsrByYears = {};
+let currentGrowthYears = 3; // 1-5, drives orbit speed + KPI growth line
+let currentReturnYears = 3; // 1-5, drives planet colour + KPI return line
 
 function computeMedian(values) {
   const known = values.filter(function (v) { return v !== null && v !== undefined; });
@@ -88,7 +99,7 @@ function kpiValueColor(v) {
 }
 
 // Recomputes and repaints the KPI panel from currentStocks/currentUniverse/
-// currentBenchmarkTsr. Never re-fetches anything — every value it needs is
+// currentBenchmarkTsrByYears. Never re-fetches anything — every value it needs is
 // already sitting on the stocks the orbital map was given, so the universe
 // toggle is instant with no Streamlit round-trip.
 function renderKpiPanel() {
@@ -111,14 +122,24 @@ function renderKpiPanel() {
     ? "N/A"
     : generatingCount + " of " + knownCash.length + " companies";
 
+  const benchmarkTsr = currentBenchmarkTsrByYears ? currentBenchmarkTsrByYears[currentReturnYears] : null;
+  const arkkTsr = currentArkkTsrByYears ? currentArkkTsrByYears[currentReturnYears] : null;
+
   let tsrColor = "#e9edf5", tsrSub = "";
   if (tsr.median !== null) {
-    if (currentBenchmarkTsr === null || currentBenchmarkTsr === undefined) {
-      tsrSub = " <span style='color:#8a8f9c;'>(S&amp;P: n/a)</span>";
+    const benchParts = [];
+    if (benchmarkTsr === null || benchmarkTsr === undefined) {
+      benchParts.push("S&amp;P n/a");
     } else {
-      tsrColor = tsr.median >= currentBenchmarkTsr ? "#4fd1a5" : "#ff6b6b";
-      tsrSub = " <span style='color:#8a8f9c;'>(S&amp;P " + fmtPctSigned(currentBenchmarkTsr) + ")</span>";
+      tsrColor = tsr.median >= benchmarkTsr ? "#4fd1a5" : "#ff6b6b";
+      benchParts.push("S&amp;P " + fmtPctSigned(benchmarkTsr));
     }
+    if (arkkTsr === null || arkkTsr === undefined) {
+      benchParts.push("ARKK n/a");
+    } else {
+      benchParts.push("ARKK " + fmtPctSigned(arkkTsr));
+    }
+    tsrSub = " <span style='color:#8a8f9c;'>(" + benchParts.join(" &middot; ") + ")</span>";
   }
 
   panel.innerHTML =
@@ -131,12 +152,12 @@ function renderKpiPanel() {
         "border:1px solid #444;cursor:pointer;background:" + (currentUniverse === "all" ? "#3a4a63" : "transparent") +
         ";color:#eee;'>All companies</button>" +
     "</div>" +
-    "<div>Growth (3y): <span style='color:" + kpiValueColor(growth.median) + ";font-weight:600;'>" +
+    "<div>Growth (" + currentGrowthYears + "y): <span style='color:" + kpiValueColor(growth.median) + ";font-weight:600;'>" +
       fmtPctSigned(growth.median) + "</span> <span style='color:#8a8f9c;font-size:10px;'>n=" + growth.n + "</span></div>" +
     "<div>Op. margin: <span style='color:" + kpiValueColor(margin.median) + ";font-weight:600;'>" +
       fmtPctSigned(margin.median) + "</span> <span style='color:#8a8f9c;font-size:10px;'>n=" + margin.n + "</span></div>" +
     "<div>Cash generating: <span style='font-weight:600;'>" + cashLine + "</span></div>" +
-    "<div>3yr return: <span style='color:" + tsrColor + ";font-weight:600;'>" + fmtPctSigned(tsr.median) + "</span>" + tsrSub + "</div>";
+    "<div>" + currentReturnYears + "yr return: <span style='color:" + tsrColor + ";font-weight:600;'>" + fmtPctSigned(tsr.median) + "</span>" + tsrSub + " <span style='color:#8a8f9c;font-size:10px;'>n=" + tsr.n + "</span></div>";
 }
 
 // Bound once, at load — not inside initOrbitalMap — so repeated data
@@ -148,7 +169,7 @@ document.getElementById("kpi-panel").addEventListener("click", function (ev) {
   renderKpiPanel();
 });
 
-function initOrbitalMap(stocks, height, benchmarkTsr) {
+function initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears) {
   const svgns = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("orbital-svg");
   const tooltip = document.getElementById("tooltip");
@@ -156,8 +177,8 @@ function initOrbitalMap(stocks, height, benchmarkTsr) {
   root.style.height = height + "px";
 
   currentStocks = stocks;
-  currentBenchmarkTsr = (benchmarkTsr === undefined) ? null : benchmarkTsr;
-  renderKpiPanel();
+  currentBenchmarkTsrByYears = (benchmarkTsrByYears === undefined || benchmarkTsrByYears === null) ? {} : benchmarkTsrByYears;
+  currentArkkTsrByYears = (arkkTsrByYears === undefined || arkkTsrByYears === null) ? {} : arkkTsrByYears;
 
   const CX = 700, CY = 425;
   // Purely decorative background grid now — distance is a continuous
@@ -224,8 +245,8 @@ function initOrbitalMap(stocks, height, benchmarkTsr) {
   const knownCagr = stocks
     .map(function (s) { return s.revenue_cagr_pct; })
     .filter(function (v) { return v !== null && v !== undefined; });
-  const cagrMin = knownCagr.length ? Math.min.apply(null, knownCagr) : 0;
-  const cagrMax = knownCagr.length ? Math.max.apply(null, knownCagr) : 1;
+  let cagrMin = knownCagr.length ? Math.min.apply(null, knownCagr) : 0;
+  let cagrMax = knownCagr.length ? Math.max.apply(null, knownCagr) : 1;
 
   function speedDegPerSecFor(revenueCagrPct) {
     if (revenueCagrPct === null || revenueCagrPct === undefined) return MIN_SPEED_DEG;
@@ -292,8 +313,67 @@ function initOrbitalMap(stocks, height, benchmarkTsr) {
       setComponentValue(s.ticker);
     });
 
-    return { s: s, g: g, ringR: ringR, angle: angle0, speedDeg: speedDeg };
+    return { s: s, g: g, circle: circle, ringR: ringR, angle: angle0, speedDeg: speedDeg };
   });
+
+  // ---- Legend sliders: 1-5 year window for growth (speed) and ------
+  // ---- return (colour). Both recompute purely client-side from the --
+  // ---- per-company revenue_cagr_by_years / tsr_by_years already sent
+  // ---- over — no Streamlit round-trip, matching the KPI toggle. The
+  // ---- KPI panel's growth/return lines follow the same selection.
+  const growthSlider = document.getElementById("growth-years-slider");
+  const growthLabel = document.getElementById("growth-years-label");
+  const returnSlider = document.getElementById("return-years-slider");
+  const returnLabel = document.getElementById("return-years-label");
+
+  function applyGrowthYears() {
+    if (growthLabel) growthLabel.textContent = String(currentGrowthYears);
+
+    const knownForYears = stocks
+      .map(function (s) { return s.revenue_cagr_by_years ? s.revenue_cagr_by_years[currentGrowthYears] : null; })
+      .filter(function (v) { return v !== null && v !== undefined; });
+    cagrMin = knownForYears.length ? Math.min.apply(null, knownForYears) : 0;
+    cagrMax = knownForYears.length ? Math.max.apply(null, knownForYears) : 1;
+
+    planets.forEach(function (p) {
+      const val = p.s.revenue_cagr_by_years ? p.s.revenue_cagr_by_years[currentGrowthYears] : null;
+      p.s.revenue_cagr_pct = (val === undefined) ? null : val; // keeps the tooltip in sync too
+      p.speedDeg = speedDegPerSecFor(p.s.revenue_cagr_pct);
+    });
+    renderKpiPanel();
+  }
+
+  function applyReturnYears() {
+    if (returnLabel) returnLabel.textContent = String(currentReturnYears);
+
+    planets.forEach(function (p) {
+      const val = p.s.tsr_by_years ? p.s.tsr_by_years[currentReturnYears] : null;
+      p.s.tsr_3y_pct = (val === undefined) ? null : val; // keeps the tooltip in sync too
+      p.circle.setAttribute("fill", colorForReturn(p.s.tsr_3y_pct));
+    });
+    renderKpiPanel();
+  }
+
+  if (growthSlider) {
+    growthSlider.value = String(currentGrowthYears);
+    growthSlider.oninput = function () {
+      currentGrowthYears = parseInt(growthSlider.value, 10);
+      applyGrowthYears();
+    };
+  }
+  if (returnSlider) {
+    returnSlider.value = String(currentReturnYears);
+    returnSlider.oninput = function () {
+      currentReturnYears = parseInt(returnSlider.value, 10);
+      applyReturnYears();
+    };
+  }
+
+  // Apply once up front — covers both the normal first-load case and a
+  // rare data reload while a non-default year was already selected, and
+  // is what actually renders the KPI panel for the first time.
+  applyGrowthYears();
+  applyReturnYears();
 
   function fmtPct(v) {
     if (v === null || v === undefined) return "insufficient data";
@@ -317,8 +397,8 @@ function initOrbitalMap(stocks, height, benchmarkTsr) {
       "<div style='color:#9aa;margin-bottom:4px;'>" + s.category + "</div>" +
       "<div>Market cap: " + fmtCap(s.market_cap) + "</div>" +
       "<div>Operating margin: " + fmtPct(s.operating_margin_pct) + "</div>" +
-      "<div>Revenue growth (3y CAGR): " + fmtPct(s.revenue_cagr_pct) + "</div>" +
-      "<div>3-year shareholder return: " + fmtPct(s.tsr_3y_pct) + "</div>" +
+      "<div>Revenue growth (" + currentGrowthYears + "y CAGR): " + fmtPct(s.revenue_cagr_pct) + "</div>" +
+      "<div>" + currentReturnYears + "-year shareholder return: " + fmtPct(s.tsr_3y_pct) + "</div>" +
       "<div>Cash runway: " + fmtRunway(s) + "</div>" +
       "<div style='margin-top:4px;color:#9aa;'>Click to view detail</div>";
     tooltip.style.display = "block";
@@ -355,20 +435,24 @@ window.addEventListener("message", function (event) {
   const args = data.args || {};
   const stocks = args.stocks || [];
   const height = args.height || 850;
-  const benchmarkTsr = (args.benchmark_tsr === undefined) ? null : args.benchmark_tsr;
+  const benchmarkTsrByYears = (args.benchmark_tsr_by_years === undefined || args.benchmark_tsr_by_years === null)
+    ? {} : args.benchmark_tsr_by_years;
+  const arkkTsrByYears = (args.arkk_tsr_by_years === undefined || args.arkk_tsr_by_years === null)
+    ? {} : args.arkk_tsr_by_years;
 
   // Guard against re-initializing (and restarting the animation) on every
   // Streamlit script rerun — only rebuild if the actual dataset changed.
   const stocksKey = JSON.stringify(stocks);
   if (initialized && stocksKey === lastStocksKey) {
-    currentBenchmarkTsr = benchmarkTsr;
+    currentBenchmarkTsrByYears = benchmarkTsrByYears;
+    currentArkkTsrByYears = arkkTsrByYears;
     renderKpiPanel();
     setFrameHeight(height + 10);
     return;
   }
   initialized = true;
   lastStocksKey = stocksKey;
-  initOrbitalMap(stocks, height, benchmarkTsr);
+  initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears);
 });
 
 sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
