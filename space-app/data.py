@@ -29,6 +29,7 @@ SPACE_COMPANIES = {
     "SPCE": {"name": "Virgin Galactic", "category": "Space Tourism"},
     "LMT": {"name": "Lockheed Martin", "category": "Aerospace & Defence"},
     "LHX": {"name": "L3Harris Technologies", "category": "Aerospace & Defence"},
+    "SIDU": {"name": "Sidus Space", "category": "Space Infrastructure"},
 }
 
 # Backwards-compatible name -> ticker mapping, in case other modules
