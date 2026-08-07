@@ -36,6 +36,15 @@
       <div><span style="color:#2ecc71;">&#9679;</span> strong return &nbsp;
            <span style="color:#8b1a1a;">&#9679;</span> weak/negative return &nbsp;
            <span style="color:#6b7280;">&#9679;</span> no data</div>
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid #3a3f4a;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <span>Show tickers on planets</span>
+        <button id="ticker-toggle" type="button"
+                aria-pressed="false"
+                style="padding:3px 8px;font-size:11px;border-radius:5px;border:1px solid #444;
+                       cursor:pointer;background:transparent;color:#eee;">
+          Off
+        </button>
+      </div>
     </div>
     <div id="kpi-panel" style="background:rgba(20,22,28,0.85);color:#ddd;padding:10px 14px;
          border-radius:8px;font-size:12px;line-height:1.6;">
@@ -77,6 +86,7 @@ let currentBenchmarkTsrByYears = {};
 let currentArkkTsrByYears = {};
 let currentGrowthYears = 3; // 1-5, drives orbit speed + KPI growth line
 let currentReturnYears = 3; // 1-5, drives planet colour + KPI return line
+let showTickers = false; // show each ticker centred on its planet
 
 function computeMedian(values) {
   const known = values.filter(function (v) { return v !== null && v !== undefined; });
@@ -169,6 +179,19 @@ document.getElementById("kpi-panel").addEventListener("click", function (ev) {
   renderKpiPanel();
 });
 
+const tickerToggle = document.getElementById("ticker-toggle");
+if (tickerToggle) {
+  tickerToggle.addEventListener("click", function () {
+    showTickers = !showTickers;
+    tickerToggle.setAttribute("aria-pressed", String(showTickers));
+    tickerToggle.textContent = showTickers ? "On" : "Off";
+    tickerToggle.style.background = showTickers ? "#3a4a63" : "transparent";
+    document.querySelectorAll(".planet-ticker").forEach(function (label) {
+      label.setAttribute("display", showTickers ? "block" : "none");
+    });
+  });
+}
+
 function initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears) {
   const svgns = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("orbital-svg");
@@ -241,7 +264,7 @@ function initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears) {
 
   // ---- Orbit speed: 3-year revenue CAGR, min-max normalized --------
   const MIN_SPEED_DEG = 2;
-  const MAX_SPEED_DEG = 45;
+  const MAX_SPEED_DEG = 40;
   const knownCagr = stocks
     .map(function (s) { return s.revenue_cagr_pct; })
     .filter(function (v) { return v !== null && v !== undefined; });
@@ -300,6 +323,24 @@ function initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears) {
       stroke: "rgba(255,255,255,0.35)", "stroke-width": 1.5,
     });
     g.appendChild(circle);
+
+    const tickerLabel = el("text", {
+      class: "planet-ticker",
+      x: 0,
+      y: 0,
+      "text-anchor": "middle",
+      "dominant-baseline": "central",
+      fill: "#ffffff",
+      "font-size": Math.max(12, Math.min(18, r * 0.55)),
+      "font-weight": "700",
+      "pointer-events": "none",
+      "paint-order": "stroke",
+      stroke: "rgba(0,0,0,0.65)",
+      "stroke-width": 2.5,
+      display: "none",
+    });
+    tickerLabel.textContent = s.ticker;
+    g.appendChild(tickerLabel);
     svg.appendChild(g);
 
     g.addEventListener("mouseenter", function () { showTooltip(s); });
