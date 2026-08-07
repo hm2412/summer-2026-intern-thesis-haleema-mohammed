@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+</style>
+</head>
+<body>
+<div id="orbital-root" style="position:relative;width:100%;
+     background:#0b0d14;border-radius:12px;overflow:hidden;
+     font-family:-apple-system,Segoe UI,Roboto,sans-serif;">
+  <svg id="orbital-svg" width="100%" height="100%" viewBox="0 0 1400 850"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <div id="tooltip" style="position:absolute;pointer-events:none;display:none;
+       background:rgba(20,22,28,0.96);color:#f2f2f2;padding:8px 10px;
+       border-radius:6px;font-size:12px;line-height:1.5;max-width:220px;
+       box-shadow:0 4px 12px rgba(0,0,0,0.4);z-index:5;"></div>
+  <div id="side-panel" style="position:absolute;top:12px;left:12px;
+       display:inline-flex;flex-direction:column;align-items:stretch;gap:10px;z-index:4;">
+    <div id="legend" style="background:rgba(20,22,28,0.85);color:#ddd;padding:10px 14px;
+         border-radius:8px;font-size:12px;line-height:1.7;">
+      <div style="font-weight:600;margin-bottom:4px;">Legend</div>
+      <div>Size &mdash; market cap (log scale)</div>
+      <div>Distance from sun &mdash; profitability (operating margin)</div>
+      <div>Orbit speed &mdash; <span id="growth-years-label">3</span>-year revenue growth</div>
+      <div style="margin:3px 0 8px;display:flex;align-items:center;">
+        <input type="range" id="growth-years-slider" min="1" max="3" step="1" value="3"
+               style="width:100%;accent-color:#9aa6ff;height:14px;margin:0;">
+      </div>
+      <div>Colour &mdash; <span id="return-years-label">3</span>-year shareholder return</div>
+      <div style="margin:3px 0 8px;display:flex;align-items:center;">
+        <input type="range" id="return-years-slider" min="1" max="5" step="1" value="3"
+               style="width:100%;accent-color:#4fd1a5;height:14px;margin:0;">
+      </div>
+      <div><span style="color:#2ecc71;">&#9679;</span> strong return &nbsp;
+           <span style="color:#8b1a1a;">&#9679;</span> weak/negative return &nbsp;
+           <span style="color:#6b7280;">&#9679;</span> no data</div>
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid #3a3f4a;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <span>Show tickers on planets</span>
+        <button id="ticker-toggle" type="button"
+                aria-pressed="false"
+                style="padding:3px 8px;font-size:11px;border-radius:5px;border:1px solid #444;
+                       cursor:pointer;background:transparent;color:#eee;">
+          Off
+        </button>
+      </div>
+    </div>
+    <div id="kpi-panel" style="background:rgba(20,22,28,0.85);color:#ddd;padding:10px 14px;
+         border-radius:8px;font-size:12px;line-height:1.6;">
+      <!-- populated by JS: renderKpiPanel() -->
+    </div>
+  </div>
+</div>
+
+<script>
+/* -------------------------------------------------------------------
+ * Minimal hand-rolled implementation of the Streamlit Components v1
+ * postMessage protocol. We deliberately don't pull in the official
+ * "streamlit-component-lib" package to keep this dependency-free, same
+ * as the original file's design goal. Three message types matter:
+ *   - streamlit:componentReady  (sent once, on load)
+ *   - streamlit:render          (received; carries Python kwargs in .args)
+ *   - streamlit:setComponentValue (sent on click, returned to Python)
+ *   - streamlit:setFrameHeight  (sent so the iframe sizes correctly)
+ * ----------------------------------------------------------------- */
+
+function sendToStreamlit(type, extra) {
+  const payload = Object.assign({ isStreamlitMessage: true, type: type }, extra || {});
+  window.parent.postMessage(payload, "*");
+}
+
+function setComponentValue(value) {
+  sendToStreamlit("streamlit:setComponentValue", { value: value, dataType: "json" });
+}
+
+function setFrameHeight(height) {
+  sendToStreamlit("streamlit:setFrameHeight", { height: height });
+}
+
+let initialized = false;
+let lastStocksKey = null;
+let currentUniverse = "pure-play"; // "pure-play" | "all" — client-side only, no Streamlit rerun
+let currentStocks = [];
+let currentBenchmarkTsrByYears = {};
+let currentArkkTsrByYears = {};
+let currentGrowthYears = 3; // 1-5, drives orbit speed + KPI growth line
+let currentReturnYears = 3; // 1-5, drives planet colour + KPI return line
+let showTickers = false; // show each ticker centred on its planet
+
+function computeMedian(values) {
+  const known = values.filter(function (v) { return v !== null && v !== undefined; });
+  if (!known.length) return { median: null, n: 0 };
+  const sorted = known.slice().sort(function (a, b) { return a - b; });
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  return { median: median, n: sorted.length };
+}
+
+function fmtPctSigned(v, digits) {
+  if (v === null || v === undefined) return "N/A";
+  digits = digits === undefined ? 1 : digits;
+  return (v >= 0 ? "+" : "") + v.toFixed(digits) + "%";
+}
+
+function kpiValueColor(v) {
+  if (v === null || v === undefined) return "#e9edf5";
+  return v >= 0 ? "#4fd1a5" : "#ff6b6b";
+}
+
+// Recomputes and repaints the KPI panel from currentStocks/currentUniverse/
+// currentBenchmarkTsrByYears. Never re-fetches anything — every value it needs is
+// already sitting on the stocks the orbital map was given, so the universe
+// toggle is instant with no Streamlit round-trip.
+function renderKpiPanel() {
+  const panel = document.getElementById("kpi-panel");
+  if (!panel) return;
+
+  const universeStocks = currentUniverse === "pure-play"
+    ? currentStocks.filter(function (s) { return s.category !== "Aerospace & Defence"; })
+    : currentStocks;
+
+  const growth = computeMedian(universeStocks.map(function (s) { return s.revenue_cagr_pct; }));
+  const margin = computeMedian(universeStocks.map(function (s) { return s.operating_margin_pct; }));
+  const tsr = computeMedian(universeStocks.map(function (s) { return s.tsr_3y_pct; }));
+
+  const knownCash = universeStocks.filter(function (s) {
+    return s.is_cash_generating !== null && s.is_cash_generating !== undefined;
+  });
+  const generatingCount = knownCash.filter(function (s) { return s.is_cash_generating; }).length;
+  const cashLine = knownCash.length === 0
+    ? "N/A"
+    : generatingCount + " of " + knownCash.length + " companies";
+
+  const benchmarkTsr = currentBenchmarkTsrByYears ? currentBenchmarkTsrByYears[currentReturnYears] : null;
+  const arkkTsr = currentArkkTsrByYears ? currentArkkTsrByYears[currentReturnYears] : null;
+
+  let tsrColor = "#e9edf5", tsrSub = "";
+  if (tsr.median !== null) {
+    const benchParts = [];
+    if (benchmarkTsr === null || benchmarkTsr === undefined) {
+      benchParts.push("S&amp;P n/a");
+    } else {
+      tsrColor = tsr.median >= benchmarkTsr ? "#4fd1a5" : "#ff6b6b";
+      benchParts.push("S&amp;P " + fmtPctSigned(benchmarkTsr));
+    }
+    if (arkkTsr === null || arkkTsr === undefined) {
+      benchParts.push("ARKK n/a");
+    } else {
+      benchParts.push("ARKK " + fmtPctSigned(arkkTsr));
+    }
+    tsrSub = " <span style='color:#8a8f9c;'>(" + benchParts.join(" &middot; ") + ")</span>";
+  }
+
+  panel.innerHTML =
+    "<div style='font-weight:600;margin-bottom:4px;'>Sector KPIs</div>" +
+    "<div style='display:flex;gap:4px;margin:6px 0 8px;'>" +
+      "<button data-universe='pure-play' style='flex:1;padding:3px 2px;font-size:11px;border-radius:5px;" +
+        "border:1px solid #444;cursor:pointer;background:" + (currentUniverse === "pure-play" ? "#3a4a63" : "transparent") +
+        ";color:#eee;'>Pure-play</button>" +
+      "<button data-universe='all' style='flex:1;padding:3px 2px;font-size:11px;border-radius:5px;" +
+        "border:1px solid #444;cursor:pointer;background:" + (currentUniverse === "all" ? "#3a4a63" : "transparent") +
+        ";color:#eee;'>All companies</button>" +
+    "</div>" +
+    "<div>Growth (" + currentGrowthYears + "y): <span style='color:" + kpiValueColor(growth.median) + ";font-weight:600;'>" +
+      fmtPctSigned(growth.median) + "</span> <span style='color:#8a8f9c;font-size:10px;'>n=" + growth.n + "</span></div>" +
+    "<div>Op. margin: <span style='color:" + kpiValueColor(margin.median) + ";font-weight:600;'>" +
+      fmtPctSigned(margin.median) + "</span> <span style='color:#8a8f9c;font-size:10px;'>n=" + margin.n + "</span></div>" +
+    "<div>Cash generating: <span style='font-weight:600;'>" + cashLine + "</span></div>" +
+    "<div>" + currentReturnYears + "yr return: <span style='color:" + tsrColor + ";font-weight:600;'>" + fmtPctSigned(tsr.median) + "</span>" + tsrSub + " <span style='color:#8a8f9c;font-size:10px;'>n=" + tsr.n + "</span></div>";
+}
+
+// Bound once, at load — not inside initOrbitalMap — so repeated data
+// updates never stack up duplicate listeners on the same panel element.
+document.getElementById("kpi-panel").addEventListener("click", function (ev) {
+  const btn = ev.target.closest("[data-universe]");
+  if (!btn) return;
+  currentUniverse = btn.dataset.universe;
+  renderKpiPanel();
+});
+
+const tickerToggle = document.getElementById("ticker-toggle");
+if (tickerToggle) {
+  tickerToggle.addEventListener("click", function () {
+    showTickers = !showTickers;
+    tickerToggle.setAttribute("aria-pressed", String(showTickers));
+    tickerToggle.textContent = showTickers ? "On" : "Off";
+    tickerToggle.style.background = showTickers ? "#3a4a63" : "transparent";
+    document.querySelectorAll(".planet-ticker").forEach(function (label) {
+      label.setAttribute("display", showTickers ? "block" : "none");
+    });
+  });
+}
+
+function initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears) {
+  const svgns = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("orbital-svg");
+  const tooltip = document.getElementById("tooltip");
+  const root = document.getElementById("orbital-root");
+  root.style.height = height + "px";
+
+  currentStocks = stocks;
+  currentBenchmarkTsrByYears = (benchmarkTsrByYears === undefined || benchmarkTsrByYears === null) ? {} : benchmarkTsrByYears;
+  currentArkkTsrByYears = (arkkTsrByYears === undefined || arkkTsrByYears === null) ? {} : arkkTsrByYears;
+
+  const CX = 700, CY = 425;
+  // Purely decorative background grid now — distance is a continuous
+  // function of profitability (see orbitRadiusFor below), not a fixed
+  // lane assignment, so these no longer mark category boundaries.
+  const GUIDE_RADII = [130, 290, 440];
+  const MIN_ORBIT_PX = 110;
+  const MAX_ORBIT_PX = 450;
+  const ORBIT_JITTER = 30;
+  const NO_DATA_COLOR = "#6b7280";
+
+  const reduceMotion = window.matchMedia &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function el(tag, attrs) {
+    const e = document.createElementNS(svgns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  GUIDE_RADII.forEach(function (r) {
+    svg.appendChild(el("circle", {
+      cx: CX, cy: CY, r: r, fill: "none",
+      stroke: "#333a4a", "stroke-width": 1, "stroke-dasharray": "3 5",
+    }));
+  });
+  svg.appendChild(el("circle", { cx: CX, cy: CY, r: 34, fill: "#f2a93b", opacity: 0.25 }));
+  svg.appendChild(el("circle", { cx: CX, cy: CY, r: 22, fill: "#f2c94c" }));
+  const sunLabel = el("text", { x: CX, y: CY + 46, "text-anchor": "middle", fill: "#aaa", "font-size": 12 });
+  sunLabel.textContent = "Profitability";
+  svg.appendChild(sunLabel);
+
+  // ---- Size: log-scaled market cap, min-max normalized -------------
+  const knownCapsB = stocks
+    .map(function (s) { return s.market_cap; })
+    .filter(function (v) { return v !== null && v !== undefined && v > 0; })
+    .map(function (v) { return Math.log10(v / 1e9); });
+  const logCapMin = knownCapsB.length ? Math.min.apply(null, knownCapsB) : 0;
+  const logCapMax = knownCapsB.length ? Math.max.apply(null, knownCapsB) : 1;
+
+  function radiusFor(marketCap) {
+    if (marketCap === null || marketCap === undefined || marketCap <= 0) return 12;
+    const logB = Math.log10(Math.max(marketCap / 1e9, 0.001));
+    const span = (logCapMax - logCapMin) || 1;
+    const t = (logB - logCapMin) / span;
+    return 14 + t * 44; // 14px smallest known cap .. 58px largest
+  }
+
+  // ---- Distance from sun: continuous, from profitability_score -----
+  // profitability_score is tanh(operating margin) computed in Python;
+  // +1 = strongly profitable (close orbit), -1 = deeply unprofitable
+  // (far orbit). Unknown margin is pushed to the outer edge.
+  function orbitRadiusFor(profitabilityScore) {
+    if (profitabilityScore === null || profitabilityScore === undefined) return MAX_ORBIT_PX;
+    const clamped = Math.max(-1, Math.min(1, profitabilityScore));
+    const mid = (MIN_ORBIT_PX + MAX_ORBIT_PX) / 2;
+    const amp = (MAX_ORBIT_PX - MIN_ORBIT_PX) / 2;
+    return mid - clamped * amp;
+  }
+
+  // ---- Orbit speed: 3-year revenue CAGR, min-max normalized --------
+  const MIN_SPEED_DEG = 2;
+  const MAX_SPEED_DEG = 40;
+  const knownCagr = stocks
+    .map(function (s) { return s.revenue_cagr_pct; })
+    .filter(function (v) { return v !== null && v !== undefined; });
+  let cagrMin = knownCagr.length ? Math.min.apply(null, knownCagr) : 0;
+  let cagrMax = knownCagr.length ? Math.max.apply(null, knownCagr) : 1;
+
+  function speedDegPerSecFor(revenueCagrPct) {
+    if (revenueCagrPct === null || revenueCagrPct === undefined) return MIN_SPEED_DEG;
+    if (cagrMax === cagrMin) return (MIN_SPEED_DEG + MAX_SPEED_DEG) / 2;
+    const t = (revenueCagrPct - cagrMin) / (cagrMax - cagrMin);
+    return MIN_SPEED_DEG + t * (MAX_SPEED_DEG - MIN_SPEED_DEG);
+  }
+
+  // ---- Colour: diverging scale from 3-year shareholder return ------
+  function rgbToHex(c) {
+    return "#" + c.map(function (v) {
+      return Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
+    }).join("");
+  }
+
+  const RETURN_COLOR_STOPS = [
+    { v: -75, c: [139, 26, 26] },   // deep red
+    { v: -25, c: [230, 126, 60] },  // orange
+    { v: 25, c: [143, 214, 148] },  // light green
+    { v: 75, c: [46, 204, 113] },   // green
+  ];
+
+  function colorForReturn(tsrPct) {
+    if (tsrPct === null || tsrPct === undefined) return NO_DATA_COLOR;
+    const clamped = Math.max(-100, Math.min(100, tsrPct));
+    if (clamped <= RETURN_COLOR_STOPS[0].v) return rgbToHex(RETURN_COLOR_STOPS[0].c);
+    const last = RETURN_COLOR_STOPS[RETURN_COLOR_STOPS.length - 1];
+    if (clamped >= last.v) return rgbToHex(last.c);
+    for (let i = 0; i < RETURN_COLOR_STOPS.length - 1; i++) {
+      const a = RETURN_COLOR_STOPS[i], b = RETURN_COLOR_STOPS[i + 1];
+      if (clamped >= a.v && clamped <= b.v) {
+        const t = (clamped - a.v) / (b.v - a.v);
+        const c = a.c.map(function (ch, idx) { return ch + t * (b.c[idx] - ch); });
+        return rgbToHex(c);
+      }
+    }
+    return NO_DATA_COLOR;
+  }
+
+  const planets = stocks.map(function (s, i) {
+    const jitter = ((i * 37) % ORBIT_JITTER) - ORBIT_JITTER / 2;
+    const ringR = orbitRadiusFor(s.profitability_score) + jitter;
+    const angle0 = (i / stocks.length) * Math.PI * 2;
+    const speedDeg = speedDegPerSecFor(s.revenue_cagr_pct);
+    const r = radiusFor(s.market_cap);
+    const fillColor = colorForReturn(s.tsr_3y_pct);
+
+    const g = el("g", { style: "cursor:pointer;" });
+    const circle = el("circle", {
+      r: r, fill: fillColor, opacity: 0.92,
+      stroke: "rgba(255,255,255,0.35)", "stroke-width": 1.5,
+    });
+    g.appendChild(circle);
+
+    const tickerLabel = el("text", {
+      class: "planet-ticker",
+      x: 0,
+      y: 0,
+      "text-anchor": "middle",
+      "dominant-baseline": "central",
+      fill: "#ffffff",
+      "font-size": Math.max(12, Math.min(18, r * 0.55)),
+      "font-weight": "700",
+      "pointer-events": "none",
+      "paint-order": "stroke",
+      stroke: "rgba(0,0,0,0.65)",
+      "stroke-width": 2.5,
+      display: "none",
+    });
+    tickerLabel.textContent = s.ticker;
+    g.appendChild(tickerLabel);
+    svg.appendChild(g);
+
+    g.addEventListener("mouseenter", function () { showTooltip(s); });
+    g.addEventListener("mousemove", function (ev) { positionTooltip(ev); });
+    g.addEventListener("mouseleave", function () { tooltip.style.display = "none"; });
+
+    /* This is the fix: report the click straight to Python via the
+       component protocol instead of trying to navigate the parent page,
+       which the sandboxed iframe silently blocks. */
+    g.addEventListener("click", function () {
+      setComponentValue(s.ticker);
+    });
+
+    return { s: s, g: g, circle: circle, ringR: ringR, angle: angle0, speedDeg: speedDeg };
+  });
+
+  // ---- Legend sliders: 1-5 year window for growth (speed) and ------
+  // ---- return (colour). Both recompute purely client-side from the --
+  // ---- per-company revenue_cagr_by_years / tsr_by_years already sent
+  // ---- over — no Streamlit round-trip, matching the KPI toggle. The
+  // ---- KPI panel's growth/return lines follow the same selection.
+  const growthSlider = document.getElementById("growth-years-slider");
+  const growthLabel = document.getElementById("growth-years-label");
+  const returnSlider = document.getElementById("return-years-slider");
+  const returnLabel = document.getElementById("return-years-label");
+
+  function applyGrowthYears() {
+    if (growthLabel) growthLabel.textContent = String(currentGrowthYears);
+
+    const knownForYears = stocks
+      .map(function (s) { return s.revenue_cagr_by_years ? s.revenue_cagr_by_years[currentGrowthYears] : null; })
+      .filter(function (v) { return v !== null && v !== undefined; });
+    cagrMin = knownForYears.length ? Math.min.apply(null, knownForYears) : 0;
+    cagrMax = knownForYears.length ? Math.max.apply(null, knownForYears) : 1;
+
+    planets.forEach(function (p) {
+      const val = p.s.revenue_cagr_by_years ? p.s.revenue_cagr_by_years[currentGrowthYears] : null;
+      p.s.revenue_cagr_pct = (val === undefined) ? null : val; // keeps the tooltip in sync too
+      p.speedDeg = speedDegPerSecFor(p.s.revenue_cagr_pct);
+    });
+    renderKpiPanel();
+  }
+
+  function applyReturnYears() {
+    if (returnLabel) returnLabel.textContent = String(currentReturnYears);
+
+    planets.forEach(function (p) {
+      const val = p.s.tsr_by_years ? p.s.tsr_by_years[currentReturnYears] : null;
+      p.s.tsr_3y_pct = (val === undefined) ? null : val; // keeps the tooltip in sync too
+      p.circle.setAttribute("fill", colorForReturn(p.s.tsr_3y_pct));
+    });
+    renderKpiPanel();
+  }
+
+  if (growthSlider) {
+    growthSlider.value = String(currentGrowthYears);
+    growthSlider.oninput = function () {
+      currentGrowthYears = parseInt(growthSlider.value, 10);
+      applyGrowthYears();
+    };
+  }
+  if (returnSlider) {
+    returnSlider.value = String(currentReturnYears);
+    returnSlider.oninput = function () {
+      currentReturnYears = parseInt(returnSlider.value, 10);
+      applyReturnYears();
+    };
+  }
+
+  // Apply once up front — covers both the normal first-load case and a
+  // rare data reload while a non-default year was already selected, and
+  // is what actually renders the KPI panel for the first time.
+  applyGrowthYears();
+  applyReturnYears();
+
+  function fmtPct(v) {
+    if (v === null || v === undefined) return "insufficient data";
+    return (v >= 0 ? "+" : "") + v.toFixed(0) + "%";
+  }
+
+  function fmtCap(v) {
+    if (v === null || v === undefined || v <= 0) return "insufficient data";
+    return "$" + (v / 1e9).toFixed(1) + "B";
+  }
+
+  function fmtRunway(s) {
+    if (s.is_cash_generating) return "cash-generating (self-funded)";
+    if (s.cash_runway_years === null || s.cash_runway_years === undefined) return "insufficient data";
+    return s.cash_runway_years.toFixed(1) + " years";
+  }
+
+  function showTooltip(s) {
+    tooltip.innerHTML =
+      "<div style='font-weight:600;margin-bottom:2px;'>" + s.ticker + " &mdash; " + s.name + "</div>" +
+      "<div style='color:#9aa;margin-bottom:4px;'>" + s.category + "</div>" +
+      "<div>Market cap: " + fmtCap(s.market_cap) + "</div>" +
+      "<div>Operating margin: " + fmtPct(s.operating_margin_pct) + "</div>" +
+      "<div>Revenue growth (" + currentGrowthYears + "y CAGR): " + fmtPct(s.revenue_cagr_pct) + "</div>" +
+      "<div>" + currentReturnYears + "-year shareholder return: " + fmtPct(s.tsr_3y_pct) + "</div>" +
+      "<div>Cash runway: " + fmtRunway(s) + "</div>" +
+      "<div style='margin-top:4px;color:#9aa;'>Click to view detail</div>";
+    tooltip.style.display = "block";
+  }
+
+  function positionTooltip(ev) {
+    const rect = root.getBoundingClientRect();
+    tooltip.style.left = (ev.clientX - rect.left + 14) + "px";
+    tooltip.style.top = (ev.clientY - rect.top + 14) + "px";
+  }
+
+  let lastTs = null;
+  function frame(ts) {
+    if (lastTs === null) lastTs = ts;
+    const dtSec = (ts - lastTs) / 1000;
+    lastTs = ts;
+    planets.forEach(function (p) {
+      if (!reduceMotion) p.angle += (p.speedDeg * Math.PI / 180) * dtSec;
+      const x = CX + p.ringR * Math.cos(p.angle);
+      const y = CY + p.ringR * Math.sin(p.angle);
+      p.g.setAttribute("transform", "translate(" + x + "," + y + ")");
+    });
+    if (!reduceMotion) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  setFrameHeight(height + 10);
+}
+
+window.addEventListener("message", function (event) {
+  const data = event.data;
+  if (!data || data.type !== "streamlit:render") return;
+
+  const args = data.args || {};
+  const stocks = args.stocks || [];
+  const height = args.height || 850;
+  const benchmarkTsrByYears = (args.benchmark_tsr_by_years === undefined || args.benchmark_tsr_by_years === null)
+    ? {} : args.benchmark_tsr_by_years;
+  const arkkTsrByYears = (args.arkk_tsr_by_years === undefined || args.arkk_tsr_by_years === null)
+    ? {} : args.arkk_tsr_by_years;
+
+  // Guard against re-initializing (and restarting the animation) on every
+  // Streamlit script rerun — only rebuild if the actual dataset changed.
+  const stocksKey = JSON.stringify(stocks);
+  if (initialized && stocksKey === lastStocksKey) {
+    currentBenchmarkTsrByYears = benchmarkTsrByYears;
+    currentArkkTsrByYears = arkkTsrByYears;
+    renderKpiPanel();
+    setFrameHeight(height + 10);
+    return;
+  }
+  initialized = true;
+  lastStocksKey = stocksKey;
+  initOrbitalMap(stocks, height, benchmarkTsrByYears, arkkTsrByYears);
+});
+
+sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>
